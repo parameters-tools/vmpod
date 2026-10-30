@@ -28,6 +28,13 @@ pub enum ActivePane {
     Logs,
 }
 
+/// Messages sent from async background workers to update the dashboard
+#[derive(Debug, Clone)]
+pub enum ActionMessage {
+    Status(String, Color),
+    Refresh,
+}
+
 /// Modal dialog state for user confirmations or forms
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dialog {
@@ -213,101 +220,136 @@ impl App {
         Ok(())
     }
 
-    /// Toggle start/stop for the selected instance
-    pub async fn toggle_start_stop(&mut self) -> Result<()> {
+    /// Toggle start/stop for the selected instance in background task
+    pub fn toggle_start_stop(&mut self, action_tx: &tokio::sync::mpsc::UnboundedSender<ActionMessage>) {
         let (name, running, storage_path) = {
             let Some(inst) = self.selected_instance() else {
-                return Ok(());
+                return;
             };
             (inst.name.clone(), inst.running, inst.storage_path.clone())
         };
 
+        let orchestrator = self.orchestrator.clone();
+        let tx = action_tx.clone();
+
         if running {
-            self.set_status(format!("Stopping VM '{}'...", name), Color::Yellow);
-            match self.orchestrator.down(&name).await {
-                Ok(_) => {
-                    self.set_status(format!("Successfully stopped VM '{}'.", name), Color::Green);
+            self.set_status(format!("Stopping VM '{}' (flushing disk)...", name), Color::Yellow);
+            tokio::spawn(async move {
+                match orchestrator.down(&name).await {
+                    Ok(_) => {
+                        let _ = tx.send(ActionMessage::Status(
+                            format!("Successfully stopped VM '{}'.", name),
+                            Color::Green,
+                        ));
+                        let _ = tx.send(ActionMessage::Refresh);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ActionMessage::Status(
+                            format!("Error stopping '{}': {:#}", name, e),
+                            Color::Red,
+                        ));
+                        let _ = tx.send(ActionMessage::Refresh);
+                    }
                 }
-                Err(e) => {
-                    self.set_status(format!("Error stopping '{}': {:#}", name, e), Color::Red);
-                }
-            }
+            });
         } else {
             self.set_status(format!("Starting VM '{}'...", name), Color::Yellow);
+            tokio::spawn(async move {
+                let params = UpParams {
+                    name: name.clone(),
+                    port: None,
+                    ram: "2G".to_string(),
+                    smp: 2,
+                    storage: Some(Path::new(&storage_path).to_path_buf()),
+                    image: "vmpod/qemu-runner:latest".to_string(),
+                };
+                match orchestrator.up(params).await {
+                    Ok(res) => {
+                        let _ = tx.send(ActionMessage::Status(
+                            format!("VM '{}' started on port {}.", name, res.port),
+                            Color::Green,
+                        ));
+                        let _ = tx.send(ActionMessage::Refresh);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ActionMessage::Status(
+                            format!("Error starting '{}': {:#}", name, e),
+                            Color::Red,
+                        ));
+                        let _ = tx.send(ActionMessage::Refresh);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Delete selected instance after user confirmation in background task
+    pub fn execute_delete(&mut self, name: String, action_tx: &tokio::sync::mpsc::UnboundedSender<ActionMessage>) {
+        self.set_status(format!("Deleting VM '{}'...", name), Color::Yellow);
+        let orchestrator = self.orchestrator.clone();
+        let tx = action_tx.clone();
+
+        tokio::spawn(async move {
+            let _ = orchestrator.down(&name).await;
+            let path = Path::new("./vmpod-data").join(&name);
+            if path.exists() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            let _ = tx.send(ActionMessage::Status(
+                format!("VM '{}' and storage removed.", name),
+                Color::Green,
+            ));
+            let _ = tx.send(ActionMessage::Refresh);
+        });
+    }
+
+    /// Create new VM from dialog input in background task
+    pub fn execute_create(
+        &mut self,
+        name: String,
+        ram: String,
+        smp_str: String,
+        action_tx: &tokio::sync::mpsc::UnboundedSender<ActionMessage>,
+    ) {
+        let smp = smp_str.trim().parse::<u32>().unwrap_or(2);
+        self.set_status(format!("Creating and starting VM '{}'...", name), Color::Yellow);
+        let orchestrator = self.orchestrator.clone();
+        let tx = action_tx.clone();
+
+        tokio::spawn(async move {
             let params = UpParams {
                 name: name.clone(),
                 port: None,
-                ram: "2G".to_string(),
-                smp: 2,
-                storage: Some(Path::new(&storage_path).to_path_buf()),
+                ram: if ram.trim().is_empty() { "2G".to_string() } else { ram },
+                smp: if smp == 0 { 2 } else { smp },
+                storage: None,
                 image: "vmpod/qemu-runner:latest".to_string(),
             };
-            match self.orchestrator.up(params).await {
+
+            match orchestrator.up(params).await {
                 Ok(res) => {
-                    self.set_status(
-                        format!("VM '{}' started on port {}.", name, res.port),
+                    let _ = tx.send(ActionMessage::Status(
+                        format!("VM '{}' successfully launched on port {}.", res.name, res.port),
                         Color::Green,
-                    );
+                    ));
+                    let _ = tx.send(ActionMessage::Refresh);
                 }
                 Err(e) => {
-                    self.set_status(format!("Error starting '{}': {:#}", name, e), Color::Red);
+                    let _ = tx.send(ActionMessage::Status(
+                        format!("Failed to create VM: {:#}", e),
+                        Color::Red,
+                    ));
                 }
             }
-        }
-
-        self.refresh().await?;
-        Ok(())
-    }
-
-    /// Delete selected instance after user confirmation
-    pub async fn execute_delete(&mut self, name: &str) -> Result<()> {
-        self.set_status(format!("Deleting VM '{}'...", name), Color::Yellow);
-
-        let _ = self.orchestrator.down(name).await;
-
-        // Clean up disk directory if it exists
-        let path = Path::new("./vmpod-data").join(name);
-        if path.exists() {
-            let _ = std::fs::remove_dir_all(&path);
-        }
-
-        self.set_status(format!("VM '{}' and storage removed.", name), Color::Green);
-        self.refresh().await?;
-        Ok(())
-    }
-
-    /// Create new VM from dialog input
-    pub async fn execute_create(&mut self, name: String, ram: String, smp_str: String) -> Result<()> {
-        let smp = smp_str.trim().parse::<u32>().unwrap_or(2);
-        self.set_status(format!("Creating and starting VM '{}'...", name), Color::Yellow);
-
-        let params = UpParams {
-            name: name.clone(),
-            port: None,
-            ram: if ram.trim().is_empty() { "2G".to_string() } else { ram },
-            smp: if smp == 0 { 2 } else { smp },
-            storage: None,
-            image: "vmpod/qemu-runner:latest".to_string(),
-        };
-
-        match self.orchestrator.up(params).await {
-            Ok(res) => {
-                self.set_status(
-                    format!("VM '{}' successfully launched on port {}.", res.name, res.port),
-                    Color::Green,
-                );
-            }
-            Err(e) => {
-                self.set_status(format!("Failed to create VM: {:#}", e), Color::Red);
-            }
-        }
-
-        self.refresh().await?;
-        Ok(())
+        });
     }
 
     /// Main event loop handler for keyboard input
-    pub async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+    pub async fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        action_tx: &tokio::sync::mpsc::UnboundedSender<ActionMessage>,
+    ) -> Result<()> {
         if key.kind != KeyEventKind::Press {
             return Ok(());
         }
@@ -318,7 +360,7 @@ impl App {
                 Dialog::ConfirmDelete { name } => match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                         self.dialog = None;
-                        self.execute_delete(&name).await?;
+                        self.execute_delete(name, action_tx);
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         self.dialog = None;
@@ -405,7 +447,7 @@ impl App {
                             self.set_status("VM name cannot be empty.", Color::Red);
                         } else {
                             self.dialog = None;
-                            self.execute_create(name, ram, smp).await?;
+                            self.execute_create(name, ram, smp, action_tx);
                         }
                     }
                     _ => {}
@@ -431,7 +473,7 @@ impl App {
                 self.launch_ssh()?;
             }
             KeyCode::Char(' ') | KeyCode::Char('s') => {
-                self.toggle_start_stop().await?;
+                self.toggle_start_stop(action_tx);
             }
             KeyCode::Char('n') => {
                 let default_name = format!("vm-{}", self.instances.len() + 1);
@@ -977,6 +1019,9 @@ pub async fn run_dashboard(orchestrator: Arc<VmOrchestrator>) -> Result<()> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<ActionMessage>();
 
     let mut app = App::new(orchestrator);
     let _ = app.refresh().await;
@@ -989,10 +1034,27 @@ pub async fn run_dashboard(orchestrator: Arc<VmOrchestrator>) -> Result<()> {
         original_hook(panic_info);
     }));
 
-    let tick_rate = Duration::from_millis(250);
+    let tick_rate = Duration::from_millis(50); // 20 FPS smooth event loop
     let mut last_tick = Instant::now();
 
     while !app.should_quit {
+        // Drain any messages from background tasks
+        let mut needs_refresh = false;
+        while let Ok(msg) = action_rx.try_recv() {
+            match msg {
+                ActionMessage::Status(text, color) => {
+                    app.set_status(text, color);
+                }
+                ActionMessage::Refresh => {
+                    needs_refresh = true;
+                }
+            }
+        }
+
+        if needs_refresh {
+            let _ = app.refresh().await;
+        }
+
         terminal.draw(|f| app.render(f))?;
 
         let timeout = tick_rate
@@ -1000,8 +1062,24 @@ pub async fn run_dashboard(orchestrator: Arc<VmOrchestrator>) -> Result<()> {
             .unwrap_or_else(|| Duration::from_millis(0));
 
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                app.handle_key(key).await?;
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.code == KeyCode::Enter && app.dialog.is_none() {
+                        let _ = disable_raw_mode();
+                        let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+                        app.launch_ssh()?;
+                        let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+                        let _ = enable_raw_mode();
+                        terminal.clear()?;
+                        let _ = app.refresh().await;
+                    } else {
+                        app.handle_key(key, &action_tx).await?;
+                    }
+                }
+                Event::Resize(_, _) => {
+                    terminal.clear()?;
+                }
+                _ => {}
             }
         }
 
@@ -1238,6 +1316,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_vm_modal_form_inputs() {
         let mut app = create_mock_app();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.dialog = Some(Dialog::NewVm {
             name: "init".to_string(),
             ram: "1G".to_string(),
@@ -1246,7 +1325,7 @@ mod tests {
         });
 
         // Type 'a' into name
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::NONE), &tx)
             .await
             .unwrap();
 
@@ -1256,7 +1335,7 @@ mod tests {
         }
 
         // Backspace
-        app.handle_key(KeyEvent::new(KeyCode::Backspace, crossterm::event::KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, crossterm::event::KeyModifiers::NONE), &tx)
             .await
             .unwrap();
         match &app.dialog {
@@ -1265,7 +1344,7 @@ mod tests {
         }
 
         // Tab to RAM field (index 1)
-        app.handle_key(KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE), &tx)
             .await
             .unwrap();
         match &app.dialog {
@@ -1277,12 +1356,13 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_delete_cancellation() {
         let mut app = create_mock_app();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.dialog = Some(Dialog::ConfirmDelete {
             name: "cancel-me".to_string(),
         });
 
         // Press 'n' to cancel
-        app.handle_key(KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE), &tx)
             .await
             .unwrap();
 

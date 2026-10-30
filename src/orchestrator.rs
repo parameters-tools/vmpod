@@ -314,10 +314,6 @@ impl VmOrchestrator {
                         params.name
                     );
                 } else {
-                    println!(
-                        "[*] Cleaning up stale stopped container '{}' (ID: {})...",
-                        params.name, short_id
-                    );
                     self.docker
                         .remove_container(
                             &params.name,
@@ -528,10 +524,6 @@ impl VmOrchestrator {
             .unwrap_or(false);
 
         if is_running {
-            println!(
-                "[*] Gracefully stopping container '{}' (5-second timeout for QEMU disk flush)...",
-                name
-            );
             if let Err(e) = self
                 .docker
                 .stop_container(
@@ -552,12 +544,8 @@ impl VmOrchestrator {
                     _ => return Err(e).context(format!("Failed to stop container '{name}'")),
                 }
             }
-            println!("[✓] Container '{}' stopped.", name);
-        } else {
-            println!("[*] Container '{}' is already stopped.", name);
         }
 
-        println!("[*] Removing container '{}'...", name);
         if let Err(e) = self
             .docker
             .remove_container(
@@ -585,7 +573,6 @@ impl VmOrchestrator {
             }
         }
 
-        println!("[✓] Container '{}' successfully removed.", name);
         Ok(())
     }
 
@@ -593,16 +580,13 @@ impl VmOrchestrator {
     pub async fn down_all(&self) -> Result<Vec<String>> {
         let instances = self.list_instances().await?;
         if instances.is_empty() {
-            println!("No vmpod instances currently found on host.");
             return Ok(Vec::new());
         }
 
         let mut removed = Vec::new();
         for inst in instances {
-            println!("------------------------------------------------------------");
-            match self.down(&inst.name).await {
-                Ok(_) => removed.push(inst.name),
-                Err(e) => eprintln!("[!] Failed to tear down '{}': {:#}", inst.name, e),
+            if self.down(&inst.name).await.is_ok() {
+                removed.push(inst.name);
             }
         }
         Ok(removed)

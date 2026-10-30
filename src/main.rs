@@ -175,8 +175,15 @@ async fn main() -> Result<()> {
                 println!(" Tearing Down ALL vmpod Instances");
                 println!("============================================================");
                 let removed = orchestrator.down_all().await?;
-                println!("------------------------------------------------------------");
-                println!("[✓] Teardown complete. {} instance(s) removed.", removed.len());
+                if removed.is_empty() {
+                    println!("No active or stopped vmpod instances found on host.");
+                } else {
+                    for name in &removed {
+                        println!("[✓] Container '{}' stopped and removed.", name);
+                    }
+                    println!("------------------------------------------------------------");
+                    println!("[✓] Teardown complete. {} instance(s) removed.", removed.len());
+                }
             } else {
                 let mut targets = args.names;
                 if let Some(n) = args.name {
@@ -206,7 +213,9 @@ async fn main() -> Result<()> {
                     println!("============================================================");
                     println!(" Tearing Down VM Instance: {}", target);
                     println!("============================================================");
+                    println!("[*] Gracefully stopping container '{}' (5-second timeout for QEMU disk flush)...", target);
                     orchestrator.down(&target).await?;
+                    println!("[✓] Container '{}' stopped and removed.", target);
                 }
             }
         }
