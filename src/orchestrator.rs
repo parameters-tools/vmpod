@@ -731,6 +731,35 @@ impl VmOrchestrator {
             });
         }
 
+        // Discover offline persistent instances with existing virtual disks in ./vmpod-data
+        let vmpod_data = PathBuf::from("./vmpod-data");
+        if let Ok(entries) = std::fs::read_dir(&vmpod_data) {
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type() {
+                    if file_type.is_dir() {
+                        let dir_name = entry.file_name().to_string_lossy().to_string();
+                        let disk = entry.path().join("disk.qcow2");
+                        if disk.exists() && !instances.iter().any(|i| i.name == dir_name) {
+                            let canonical = entry.path().canonicalize().unwrap_or(entry.path());
+                            instances.push(InstanceSummary {
+                                name: dir_name.clone(),
+                                container_id: "offline".to_string(),
+                                short_id: "offline".to_string(),
+                                status: "stopped".to_string(),
+                                running: false,
+                                port: None,
+                                ssh_command: format!("vmpod up {}", dir_name),
+                                uptime: "offline".to_string(),
+                                ram: "-".to_string(),
+                                smp: "-".to_string(),
+                                storage_path: canonical.to_string_lossy().to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         instances.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(instances)
     }

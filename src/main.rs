@@ -1,4 +1,5 @@
 mod orchestrator;
+mod tui;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -9,15 +10,15 @@ use std::path::PathBuf;
 #[command(
     name = "vmpod",
     author = "vmpod contributors",
-    version = "1.1.0",
+    version = "1.2.0",
     about = "Fast, local-first CLI to spin up and orchestrate hardware-accelerated Linux VMs inside Docker using QEMU/KVM",
     long_about = "vmpod allows you to launch lightweight, hardware-accelerated virtual machines inside Docker containers \
                   with direct KVM pass-through, user-space networking, automatic root credentials provisioning, \
-                  and multi-instance orchestration."
+                  multi-instance orchestration, and an interactive TUI dashboard."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -31,6 +32,9 @@ enum Commands {
     /// List all managed virtual machine instances
     #[command(alias = "ls", alias = "ps")]
     List,
+    /// Launch the interactive terminal dashboard
+    #[command(alias = "tui", alias = "ui")]
+    Dashboard,
 }
 
 #[derive(Args, Debug)]
@@ -97,9 +101,14 @@ struct StatusArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let orchestrator = VmOrchestrator::new()?;
+    let orchestrator = std::sync::Arc::new(VmOrchestrator::new()?);
 
-    match cli.command {
+    let command = cli.command.unwrap_or(Commands::Dashboard);
+
+    match command {
+        Commands::Dashboard => {
+            tui::run_dashboard(orchestrator).await?;
+        }
         Commands::Up(args) => {
             let base_name = args
                 .name

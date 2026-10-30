@@ -1,13 +1,52 @@
-# vmpod (v1.1.0)
+# vmpod (v1.2.0)
 
 [![Rust Version](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/docker-bollard%20client-2496ED.svg)](https://github.com/fussybeaver/bollard)
 [![Hypervisor](https://img.shields.io/badge/hypervisor-QEMU%20%2B%20KVM-red.svg)](https://www.qemu.org/)
+[![TUI](https://img.shields.io/badge/tui-ratatui%20%2B%20crossterm-brightgreen.svg)](https://github.com/ratatui/ratatui)
 
 **vmpod** is a fast, local-first, zero-dependency CLI written in Rust that spins up and orchestrates hardware-accelerated Linux virtual machines running inside Docker containers using **QEMU** and **KVM**.
 
-Version **1.1.0** features first-class **Multi-Instance Orchestration**, allowing you to launch, manage, inspect, and tear down clusters of isolated Linux VMs with automatic port allocation and disk isolation.
+Version **1.2.0** introduces a **Full Interactive Terminal User Interface (TUI) Dashboard** alongside multi-instance orchestration, providing live VM management, one-click interactive SSH sessions, real-time guest kernel log streaming, and modal creation/deletion workflows.
+
+---
+
+## Interactive TUI Dashboard (`vmpod dashboard` or `vmpod`)
+
+Running `vmpod` with no arguments or typing `vmpod dashboard` (aliases: `vmpod tui`, `vmpod ui`) launches an interactive full-terminal management dashboard powered by **Ratatui**:
+
+```text
+╭ ⚡  VMPOD - Hardware-Accelerated Linux VM Orchestrator ───────────────────────╮
+│    [↑/↓] Move [Enter] SSH [Space] Power [N] New [D] Del [R] Sync [Q] Quit    │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭ Virtual Machines (2) ────────╮╭ VM Instance Details ─────────────────────────╮
+│▶  ● cluster-1      [:2222]   ││ cluster-1  ● RUNNING    Uptime: 14m 20s      │
+│   ○ cluster-2      [off]     ││                                              │
+│                              ││  vCPUs:         2 cores    Memory:  2G       │
+│                              ││  SSH Port:      localhost:2222               │
+│                              ││  Container ID:  c11122233344                 │
+│                              ││  Storage Path:  /home/kevin/vmpod-data/cluste│
+│                              ││  Virtual Disk:  196 KB (differential qcow2)  │
+│                              ││  SSH Command:   ssh root@localhost -p 2222   │
+╰──────────────────────────────╯╰──────────────────────────────────────────────╯
+╭ 📜  Guest Kernel & Runner Console Logs ───────────────────────────────────────╮
+│[ 0.000000] Linux version 6.6.121-0-virt (Alpine Linux)                       │
+│[ 1.204512] eth0: leased 10.0.2.15 for 86400 seconds [ ok ]                   │
+│[ 2.112004] Tiny Cloud: bootstrap complete. sshd listening on port 22         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ Ready.  │  1 running, 1 stopped  │  vmpod v1.2.0                               
+```
+
+### Dashboard Keyboard Controls:
+- **`↑ / ↓` or `k / j`**: Navigate through all active and stopped virtual machines.
+- **`Enter`**: Instantly launches an interactive SSH session attached directly to your terminal. Typing `exit` returns seamlessly to the dashboard.
+- **`Space` or `s`**: Toggle VM power (starts stopped instances, or gracefully flushes disk caches and powers down running instances).
+- **`N`**: Opens an interactive modal form to spin up a new VM (`Name`, `RAM`, `vCPUs`).
+- **`D` or `Delete`**: Prompts for confirmation to delete a VM and purge its virtual disk.
+- **`R`**: Forces an immediate refresh of Docker states, persistent disks, and logs.
+- **`PgUp / PgDn`**: Scroll through guest kernel and runner logs.
+- **`Q` or `Esc`**: Cleanly exit the dashboard.
 
 ---
 
