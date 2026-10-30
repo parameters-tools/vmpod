@@ -1,6 +1,6 @@
 [package]
 name = "vmpod"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["vmpod contributors"]
 description = "Fast, local-first CLI to spin up and orchestrate hardware-accelerated Linux VMs inside Docker using QEMU/KVM"

@@ -1,4 +1,4 @@
-# vmpod (v1.0.0)
+# vmpod (v1.1.0)
 
 [![Rust Version](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
@@ -7,9 +7,11 @@
 
 **vmpod** is a fast, local-first, zero-dependency CLI written in Rust that spins up and orchestrates hardware-accelerated Linux virtual machines running inside Docker containers using **QEMU** and **KVM**.
 
+Version **1.1.0** features first-class **Multi-Instance Orchestration**, allowing you to launch, manage, inspect, and tear down clusters of isolated Linux VMs with automatic port allocation and disk isolation.
+
 ---
 
-## Architecture Overview
+## Multi-Instance Architecture Overview
 
 ```
 +----------------------------------------------------------------------------------+
@@ -22,41 +24,36 @@
 |   +-----------------------+                               v                      |
 |                                            +-------------------------------+     |
 |   Host Storage: ./vmpod-data/              | Docker Daemon (dockerd)       |     |
-|     ├── disk.qcow2 (qcow2 overlay)         +-------------------------------+     |
-|     └── id_ed25519 (SSH private key)                      |                      |
-|               ^                                           |                      |
-|               | Direct Bind Mount (/storage)              v                      |
-|   +--------------------------------------------------------------------------+   |
-|   | DOCKER RUNNER CONTAINER (vmpod/qemu-runner:latest)                       |   |
-|   |                                                                          |   |
-|   |   Devices:                                                               |   |
-|   |     - /dev/kvm       ──> Host Kernel KVM subsystem (Hardware Accel)      |   |
-|   |     - /dev/net/tun   ──> Virtual Network Tunneling interface             |   |
-|   |   Capabilities: NET_ADMIN                                                |   |
-|   |   Port Map:     Host 0.0.0.0:2222 ──> Container :22                      |   |
-|   |                                                                          |   |
-|   |   +------------------------------------------------------------------+   |   |
-|   |   | QEMU Process (qemu-system-x86_64)                                |   |   |
-|   |   |   - Flags: -enable-kvm -cpu host -m 2G -smp 2 -nographic         |   |   |
-|   |   |   - SLIRP Net: hostfwd=tcp::22-:22                               |   |   |
-|   |   |                                                                  |   |   |
-|   |   |   +----------------------------------------------------------+   |   |   |
-|   |   |   | GUEST VIRTUAL MACHINE (Alpine Linux 3.20)                |   |   |   |
-|   |   |   |   - Guest Kernel: vmlinuz-virt (runs on bare-metal CPU)  |   |   |   |
-|   |   |   |   - OpenSSH Server: Port 22                              |   |   |   |
-|   |   |   |   - Disk: /dev/vda (mounted to host's disk.qcow2)        |   |   |   |
-|   |   |   +----------------------------------------------------------+   |   |   |
-|   |   +------------------------------------------------------------------+   |   |
-|   +--------------------------------------------------------------------------+   |
+|     ├── <instance-1>/                      +-------------------------------+     |
+|     │     ├── disk.qcow2 (isolated overlay)               |                      |
+|     │     └── id_ed25519 (SSH private key)                |                      |
+|     └── <instance-2>/                                     |                      |
+|           ├── disk.qcow2 (isolated overlay)               v                      |
+|           └── id_ed25519 (SSH private key)                                       |
+|                                                                                  |
+|   +──────────────────────────────────────────────────────────────────────────+   |
+|   │ VM Container 1: worker-1 (Port 2222 -> Container 22)                     │   |
+|   │   - Labels: io.vmpod.managed=true, io.vmpod.name=worker-1                │   |
+|   │   - Mount:  ./vmpod-data/worker-1 -> /storage (Direct NVMe/SSD)          │   |
+|   │   - QEMU:   Hardware-accelerated Linux Guest VM (KVM)                    │   |
+|   +──────────────────────────────────────────────────────────────────────────+   |
+|   │ VM Container 2: worker-2 (Port 2223 -> Container 22)                     │   |
+|   │   - Labels: io.vmpod.managed=true, io.vmpod.name=worker-2                │   |
+|   │   - Mount:  ./vmpod-data/worker-2 -> /storage (Direct NVMe/SSD)          │   |
+|   │   - QEMU:   Hardware-accelerated Linux Guest VM (KVM)                    │   |
+|   +──────────────────────────────────────────────────────────────────────────+   |
 +----------------------------------------------------------------------------------+
 ```
 
 ### Key Engineering Features
+- **Multi-Instance Orchestration:** Concurrently run arbitrary numbers of isolated Linux VMs side-by-side with automatic port scanning and disk namespace isolation.
+- **Docker Label-Based Global Discovery:** Containers are tagged with `io.vmpod.managed=true`, `io.vmpod.name`, and resource metadata, enabling seamless discovery via `vmpod list`.
+- **Automatic Port Allocation:** Scans and binds free host SSH ports starting at `2222` when default or in-use ports are encountered.
 - **Direct Bollard Socket Integration:** Directly talks to `/var/run/docker.sock` over Unix domain sockets using `bollard`. Zero shelling out to the `docker` binary.
-- **Hardware-Accelerated Virtualization:** Full KVM pass-through (`/dev/kvm`) with near-native CPU and memory execution speeds.
+- **Hardware-Accelerated Virtualization:** Direct KVM pass-through (`/dev/kvm`) with near-native CPU and memory execution speeds.
 - **Fail-Fast Pre-Flight Engine:** Validates host `/dev/kvm` presence, device node permissions, and Docker daemon connectivity before initiating container allocation.
 - **Direct Host Volume Bypassing Overlay2:** Binds host storage directories directly to avoid Docker storage driver overhead and prevent filesystem nested copy-on-write degradation.
-- **User-Space Networking (SLIRP):** QEMU user networking maps host/container TCP port 22 directly into the guest VM without needing privileged host bridge interfaces.
+- **User-Space Networking (SLIRP):** QEMU user networking maps host/container TCP ports directly into each guest VM without requiring privileged host bridge interfaces.
 - **Automatic Root Credentials & SSH Key Provisioning:** Provisions guest root credentials (password `root` and auto-generated Ed25519 SSH keys), exporting the host SSH private key directly into `<STORAGE>/id_ed25519` with matched host user UID permissions.
 - **Graceful Shutdown:** `vmpod down` sends a graceful stop request with a 5-second timeout allowing QEMU to flush all virtual disk caches before container removal.
 
@@ -98,121 +95,127 @@ From the repository root:
 docker build -t vmpod/qemu-runner:latest .
 ```
 
-### 2. Build and Install the Rust CLI Globally
+### 2. Install the Rust CLI Globally
 ```bash
 cargo install --path .
 ```
-This places `vmpod` directly into `~/.cargo/bin/vmpod` (which is typically in your `$PATH`).
-
-Alternatively, build the binary:
-```bash
-cargo build --release
-sudo cp target/release/vmpod /usr/local/bin/
-```
+This installs `vmpod` directly into `~/.cargo/bin/vmpod` (in your `$PATH`).
 
 ---
 
-## Step-by-Step Quickstart
+## Multi-Instance Quickstart Guide
 
-### Step 1: Spin Up the VM
+### 1. Launch a Single VM
 ```bash
 vmpod up
 ```
-*Output:*
+*Spins up a VM named `vmpod-box` mapped to port `2222` with storage in `./vmpod-data`.*
+
+### 2. Launch Named VMs (Auto-Port & Storage Isolation)
+```bash
+# Launch a named VM - auto-allocates next free port (2223) and storage in ./vmpod-data/db-1
+vmpod up db-1
+
+# Launch another named VM - auto-allocates port 2224 and storage in ./vmpod-data/web-1
+vmpod up web-1
+```
+
+### 3. Launch a Cluster with Batch Mode (`--count`)
+```bash
+# Spins up worker-1, worker-2, and worker-3 simultaneously!
+vmpod up worker --count 3
+```
+
+### 4. List All Active Instances (`vmpod list` / `vmpod ls`)
+```bash
+vmpod list
+```
+**Example output:**
 ```text
-============================================================
- Launching VM Instance: vmpod-box
-============================================================
-
-[✓] Virtual Machine successfully started!
-------------------------------------------------------------
-  Name:          vmpod-box
-  Container ID:  47c9b962e820 (47c9b962e82098d3992416bfa6857ba2d335429f1ad5439760ed856aa07406e5)
-  Status:        running
-  Storage Path:  /home/kevin/vmpod-data
-  SSH Command:   ssh root@localhost -p 2222
-------------------------------------------------------------
-Connect via SSH:
-  ssh root@localhost -p 2222
-  (Default credentials: user 'root', password 'root')
-  (Or using private key: ssh -i /home/kevin/vmpod-data/id_ed25519 root@localhost -p 2222)
+=========================================================================================================
+ MANAGED VMPOD INSTANCES
+=========================================================================================================
+ NAME             STATUS       PORT           CPUS     RAM        UPTIME         SSH COMMAND             
+---------------------------------------------------------------------------------------------------------
+ db-1             ● running    2223           2        2G         3m 12s         ssh root@localhost -p 2223
+ vmpod-box        ● running    2222           2        2G         12m 45s        ssh root@localhost -p 2222
+ web-1            ● running    2224           2        2G         2m 04s         ssh root@localhost -p 2224
+ worker-1         ● running    2225           2        2G         48s            ssh root@localhost -p 2225
+ worker-2         ● running    2226           2        2G         48s            ssh root@localhost -p 2226
+ worker-3         ● running    2227           2        2G         48s            ssh root@localhost -p 2227
+---------------------------------------------------------------------------------------------------------
+Use 'vmpod status <NAME>' for details, or 'vmpod down <NAME>' to stop.
 ```
 
-### Step 2: Connect via SSH
+### 5. Connect via SSH
+Connect to any instance using its assigned port and auto-generated private key:
 
-#### Option A: Passwordless Key Login (Recommended)
 ```bash
-ssh -i ./vmpod-data/id_ed25519 root@localhost -p 2222
+# Connect to worker-1
+ssh -i ./vmpod-data/worker-1/id_ed25519 root@localhost -p 2225
+
+# Or via password 'root'
+ssh root@localhost -p 2225
 ```
 
-#### Option B: Password Login
+### 6. Inspect an Instance
 ```bash
-ssh root@localhost -p 2222
-```
-*Password:* `root`
+# Detailed inspection
+vmpod status worker-1
 
-### Step 3: Check Status
-```bash
+# Or run without arguments to view the global instance table
 vmpod status
 ```
 
-### Step 4: Stop and Remove VM
+### 7. Stop and Tear Down Instances
 ```bash
-vmpod down
+# Stop a single instance
+vmpod down worker-1
+
+# Stop multiple specific instances
+vmpod down worker-2 worker-3
+
+# Tear down ALL instances on the host
+vmpod down --all
 ```
-*(Your disk image, installed packages, and files remain safely in `./vmpod-data` for the next `vmpod up`).*
 
 ---
 
 ## Subcommand Reference
 
-### 1. `vmpod up [OPTIONS]`
-Spin up a new hardware-accelerated virtual machine container.
+### `vmpod up [NAME] [OPTIONS]`
+Spin up hardware-accelerated virtual machine container(s).
 
-| Flag | Default | Description |
+| Argument / Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--name <NAME>` | `vmpod-box` | Unique identifier for the VM container |
-| `--port <PORT>` | `2222` | Host port mapped to the VM's SSH port 22 |
+| `[NAME]` | `vmpod-box` | Name or unique identifier for the VM container |
+| `-c, --count <COUNT>` | `1` | Number of instances to spin up (creates `<NAME>-1`, `<NAME>-2`, etc.) |
+| `--port <PORT>` | `auto` | Host port mapped to guest SSH (auto-detected if omitted or in use) |
 | `--ram <RAM>` | `2G` | Guest RAM allocation (e.g. `2G`, `4G`, `8G`) |
 | `--smp <CPUS>` | `2` | Guest vCPU core count |
-| `--storage <PATH>`| `./vmpod-data` | Host directory where virtual disk images live |
+| `--storage <PATH>` | `./vmpod-data/<NAME>` | Host directory where virtual disk images live |
 | `--image <IMAGE>` | `vmpod/qemu-runner:latest` | Docker image running QEMU |
 
-**Example with custom resources:**
-```bash
-vmpod up --name dev-vm --port 2244 --ram 8G --smp 4 --storage ~/my-vms/dev
-```
+### `vmpod list` *(aliases: `ls`, `ps`)*
+List all managed virtual machine instances on the host with status, port, uptime, and resource allocations.
 
-### 2. `vmpod status [OPTIONS]`
-Inspect the live status, uptime, container ID, and port bindings of an instance.
+### `vmpod status [NAME]`
+Inspect the detailed status, uptime, storage mounts, and resource allocations of an instance. If `[NAME]` is omitted, displays the global instance table.
 
-| Flag | Default | Description |
+### `vmpod down [NAMES...] [OPTIONS]`
+Gracefully shut down QEMU (allowing disk caches to flush) and remove containers.
+
+| Argument / Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--name <NAME>` | `vmpod-box` | Name of the VM instance to inspect |
-
-**Example:**
-```bash
-vmpod status --name dev-vm
-```
-
-### 3. `vmpod down [OPTIONS]`
-Gracefully shut down QEMU (allowing disk caches to flush) and tear down the container.
-
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `--name <NAME>` | `vmpod-box` | Name of the VM instance to tear down |
-
-**Example:**
-```bash
-vmpod down --name dev-vm
-```
+| `[NAMES...]` | `vmpod-box` | One or more instance names to tear down |
+| `-a, --all` | `false` | Stop and tear down all managed `vmpod` instances on the host |
 
 ---
 
 ## Advanced Usage
 
-### 1. Running Docker Inside the VM (Nested Docker)
-Because `vmpod` runs a true hardware-virtualized Linux kernel, you can run nested Docker inside the VM!
+### Running Docker Inside the VM (Nested Docker)
+Because `vmpod` runs a true hardware-virtualized Linux kernel, you can run nested Docker inside any VM!
 
 > [!TIP]
 > **Subnet Tip:** To prevent the guest Docker bridge from colliding with your host laptop's Docker bridge (`172.17.0.1`), configure `/etc/docker/daemon.json` inside the VM before starting Docker:
@@ -232,7 +235,7 @@ service docker start
 docker run --rm hello-world
 ```
 
-### 2. Bring Your Own Linux Cloud Image
+### Bring Your Own Linux Cloud Image
 You can use any standard cloud or raw virtual disk image (Ubuntu, Debian, Fedora, Arch, etc.):
 
 ```bash
@@ -244,24 +247,9 @@ curl -L -o ./my-ubuntu-vm/disk.qcow2 \
   https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img
 
 # 3. Launch via vmpod
-vmpod up --name ubuntu-box --port 2223 --storage ./my-ubuntu-vm
+vmpod up ubuntu-box --storage ./my-ubuntu-vm
 ```
 `vmpod` automatically mounts `./my-ubuntu-vm/disk.qcow2` as the primary drive, provisions root SSH credentials via cloud-init, and boots it under KVM.
-
----
-
-## File Structure
-
-```
-vmpod/
-├── Cargo.toml            # Fully pinned dependencies (tokio, clap, bollard, anyhow)
-├── Dockerfile            # Multi-layer Alpine/QEMU runner container
-├── entrypoint.sh         # TUN/KVM configuration, dynamic disk init & QEMU runner
-├── README.md             # Production guide and documentation
-└── src/
-    ├── main.rs           # CLI definition, routing, and formatted terminal output
-    └── orchestrator.rs   # Encapsulated Bollard orchestration & pre-flight engine
-```
 
 ---
 
