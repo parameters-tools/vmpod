@@ -46,6 +46,9 @@ else
             echo "[*] Creating new 10G qcow2 virtual disk: ${DISK_PATH}"
             qemu-img create -f qcow2 "${DISK_PATH}" 10G
         fi
+        if [ -n "${HOST_UID}" ]; then
+            chown "${HOST_UID}:${HOST_GID:-${HOST_UID}}" "${DISK_PATH}" 2>/dev/null || true
+        fi
     fi
 fi
 

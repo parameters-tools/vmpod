@@ -177,7 +177,20 @@ async fn main() -> Result<()> {
                 }
 
                 if targets.is_empty() {
-                    targets.push("vmpod-box".to_string());
+                    let active_instances = orchestrator.list_instances().await?;
+                    if active_instances.is_empty() {
+                        println!("No active or stopped vmpod instances found on host.");
+                        return Ok(());
+                    } else if active_instances.len() == 1 {
+                        let sole_name = active_instances[0].name.clone();
+                        println!("[*] No target specified; defaulting to only instance '{}'", sole_name);
+                        targets.push(sole_name);
+                    } else {
+                        let names: Vec<&str> = active_instances.iter().map(|i| i.name.as_str()).collect();
+                        println!("Multiple vmpod instances found: [{}]", names.join(", "));
+                        println!("Please specify which instance to tear down: 'vmpod down <NAME>' or use 'vmpod down --all'.");
+                        return Ok(());
+                    }
                 }
 
                 for target in targets {

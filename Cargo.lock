@@ -921,6 +921,7 @@ dependencies = [
  "anyhow",
  "bollard",
  "clap",
+ "futures-util",
  "tokio",
 ]
 

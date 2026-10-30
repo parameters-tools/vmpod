@@ -254,6 +254,36 @@ impl VmOrchestrator {
         // Step 1: Pre-flight check
         self.preflight_check().await?;
 
+        // Step 1b: Input validations
+        if params.smp == 0 {
+            bail!("Invalid vCPU count: --smp must be at least 1 (got 0).");
+        }
+
+        let valid_name = !params.name.is_empty()
+            && params.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+        if !valid_name {
+            bail!(
+                "Invalid instance name '{}': only alphanumeric characters, dots, underscores, and hyphens are allowed ([a-zA-Z0-9_.-]+).",
+                params.name
+            );
+        }
+
+        let ram_trim = params.ram.trim();
+        let valid_ram = !ram_trim.is_empty() && {
+            let (num_part, unit) = ram_trim.split_at(ram_trim.len().saturating_sub(1));
+            if unit.eq_ignore_ascii_case("m") || unit.eq_ignore_ascii_case("g") {
+                num_part.parse::<u64>().map(|n| n > 0).unwrap_or(false)
+            } else {
+                ram_trim.parse::<u64>().map(|n| n > 0).unwrap_or(false)
+            }
+        };
+        if !valid_ram {
+            bail!(
+                "Invalid RAM allocation '{}': expected a positive memory size (e.g. '512M', '2G', '4G').",
+                params.ram
+            );
+        }
+
         // Step 2: Storage path preparation and isolation check
         let canonical_storage = self
             .resolve_and_validate_storage(&params.name, params.storage)
@@ -414,6 +444,32 @@ impl VmOrchestrator {
                 )
             })?;
 
+        // Step 7: Post-start health check (verify container didn't crash on boot)
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let post_inspect = self
+            .docker
+            .inspect_container(&params.name, None::<InspectContainerOptions>)
+            .await?;
+
+        if let Some(state) = post_inspect.state {
+            let running = state.running.unwrap_or(false);
+            let exit_code = state.exit_code.unwrap_or(0);
+            if !running || exit_code != 0 {
+                let logs = self.get_container_logs(&params.name, 30).await.unwrap_or_default();
+                let _ = self.docker.remove_container(
+                    &params.name,
+                    Some(RemoveContainerOptions { force: true, ..Default::default() }),
+                ).await;
+                bail!(
+                    "VM container '{}' failed during boot (exit code: {}).\n\
+                     Runner diagnostics:\n{}",
+                    params.name,
+                    exit_code,
+                    logs.trim()
+                );
+            }
+        }
+
         let ssh_command = format!("ssh root@localhost -p {}", actual_port);
 
         Ok(UpResult {
@@ -425,6 +481,28 @@ impl VmOrchestrator {
             status: "running".to_string(),
             storage_path: canonical_storage,
         })
+    }
+
+    /// Fetch recent stdout/stderr output from a container
+    pub async fn get_container_logs(&self, name: &str, tail_lines: u32) -> Result<String> {
+        use futures_util::StreamExt;
+        let mut stream = self.docker.logs(
+            name,
+            Some(bollard::query_parameters::LogsOptions {
+                stdout: true,
+                stderr: true,
+                tail: tail_lines.to_string(),
+                ..Default::default()
+            }),
+        );
+
+        let mut output = String::new();
+        while let Some(chunk) = stream.next().await {
+            if let Ok(msg) = chunk {
+                output.push_str(&msg.to_string());
+            }
+        }
+        Ok(output)
     }
 
     /// Gracefully stop the VM container with 5-second timeout and remove it
@@ -454,7 +532,8 @@ impl VmOrchestrator {
                 "[*] Gracefully stopping container '{}' (5-second timeout for QEMU disk flush)...",
                 name
             );
-            self.docker
+            if let Err(e) = self
+                .docker
                 .stop_container(
                     name,
                     Some(StopContainerOptions {
@@ -463,14 +542,24 @@ impl VmOrchestrator {
                     }),
                 )
                 .await
-                .with_context(|| format!("Failed to stop container '{name}'"))?;
+            {
+                match &e {
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 304, ..
+                    } => {
+                        // Container already stopped concurrently
+                    }
+                    _ => return Err(e).context(format!("Failed to stop container '{name}'")),
+                }
+            }
             println!("[✓] Container '{}' stopped.", name);
         } else {
             println!("[*] Container '{}' is already stopped.", name);
         }
 
         println!("[*] Removing container '{}'...", name);
-        self.docker
+        if let Err(e) = self
+            .docker
             .remove_container(
                 name,
                 Some(RemoveContainerOptions {
@@ -479,7 +568,22 @@ impl VmOrchestrator {
                 }),
             )
             .await
-            .with_context(|| format!("Failed to remove container '{name}'"))?;
+        {
+            match &e {
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                } => {
+                    // Container was already removed
+                }
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409,
+                    message,
+                } if message.contains("removal") && message.contains("in progress") => {
+                    // Container removal is already in progress
+                }
+                _ => return Err(e).context(format!("Failed to remove container '{name}'")),
+            }
+        }
 
         println!("[✓] Container '{}' successfully removed.", name);
         Ok(())
@@ -523,14 +627,10 @@ impl VmOrchestrator {
         for c in containers {
             let labels = c.labels.unwrap_or_default();
             let is_vmpod = labels.get(LABEL_MANAGED).map(|v| v == "true").unwrap_or(false)
-                || c.image
-                    .as_deref()
-                    .map(|img| img.contains("vmpod/qemu-runner"))
-                    .unwrap_or(false)
                 || c.names
                     .as_ref()
                     .and_then(|n| n.first())
-                    .map(|n| n.contains("vmpod"))
+                    .map(|n| n.trim_start_matches('/') == "vmpod-box")
                     .unwrap_or(false);
 
             if !is_vmpod {
