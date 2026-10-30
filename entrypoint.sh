@@ -61,15 +61,19 @@ fi
 cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
 chmod 600 /root/.ssh/authorized_keys
 
-# Copy private key to storage for convenient host access if not already present
+# Copy private key to storage for host access and match host user UID if provided
 if [ ! -f "${STORAGE_DIR}/id_ed25519" ]; then
     cp /root/.ssh/id_ed25519 "${STORAGE_DIR}/id_ed25519"
     cp /root/.ssh/id_ed25519.pub "${STORAGE_DIR}/id_ed25519.pub"
     chmod 600 "${STORAGE_DIR}/id_ed25519"
+    chmod 644 "${STORAGE_DIR}/id_ed25519.pub"
+    if [ -n "${HOST_UID}" ]; then
+        chown "${HOST_UID}:${HOST_GID:-${HOST_UID}}" "${STORAGE_DIR}/id_ed25519"* 2>/dev/null || true
+    fi
     echo "[*] SSH private key copied to host storage: ${STORAGE_DIR}/id_ed25519"
 fi
 
-# 5. Generate cloud-init / nocloud CIDATA disk to provision root user & SSH key in guest
+# 5. Generate cloud-init / nocloud CIDATA disk to support standard cloud images
 CIDATA_ARGS=""
 if command -v genisoimage >/dev/null 2>&1; then
     CIDATA_DIR=$(mktemp -d /tmp/cidata.XXXXXX)
@@ -87,12 +91,14 @@ disable_root: false
 chpasswd:
   list: |
     root:root
+    alpine:root
   expire: false
 ssh_authorized_keys:
   - ${PUBKEY}
 runcmd:
   - echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
-  - rc-service sshd restart || true
+  - echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+  - rc-service sshd restart 2>/dev/null || systemctl restart sshd 2>/dev/null || true
 EOF
 
     genisoimage -output /tmp/cidata.iso -volid cidata -joliet -rock "${CIDATA_DIR}/user-data" "${CIDATA_DIR}/meta-data" >/dev/null 2>&1

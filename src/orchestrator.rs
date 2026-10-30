@@ -10,6 +10,11 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+extern "C" {
+    fn getuid() -> u32;
+    fn getgid() -> u32;
+}
+
 /// Parameters for spinning up a new VM container instance
 pub struct UpParams {
     pub name: String,
@@ -212,10 +217,15 @@ impl VmOrchestrator {
             ..Default::default()
         };
 
+        let uid = unsafe { getuid() };
+        let gid = unsafe { getgid() };
+
         let env_vars = vec![
             format!("RAM={}", params.ram),
             format!("SMP={}", params.smp),
             "SSH_PORT=22".to_string(),
+            format!("HOST_UID={}", uid),
+            format!("HOST_GID={}", gid),
         ];
 
         let container_config = ContainerCreateBody {
