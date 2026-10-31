@@ -1,4 +1,4 @@
-# vmpod (v1.2.0)
+# vmpod (v1.3.0)
 
 [![Rust Version](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
@@ -6,9 +6,113 @@
 [![Hypervisor](https://img.shields.io/badge/hypervisor-QEMU%20%2B%20KVM-red.svg)](https://www.qemu.org/)
 [![TUI](https://img.shields.io/badge/tui-ratatui%20%2B%20crossterm-brightgreen.svg)](https://github.com/ratatui/ratatui)
 
-**vmpod** is a fast, local-first, zero-dependency CLI written in Rust that spins up and orchestrates hardware-accelerated Linux virtual machines running inside Docker containers using **QEMU** and **KVM**.
+**vmpod** is a fast, local-first, zero-dependency CLI and sandbox engine written in Rust that spins up and orchestrates hardware-accelerated Linux virtual machines running inside Docker containers using **QEMU** and **KVM**.
 
-Version **1.2.0** introduces a **Full Interactive Terminal User Interface (TUI) Dashboard** alongside multi-instance orchestration, providing live VM management, one-click interactive SSH sessions, real-time guest kernel log streaming, and modal creation/deletion workflows.
+Version **1.3.0** introduces the **Agentic Era Engine**: specialized agent-first subcommands (`spin`, `run`, `down`), synchronous readiness probing, non-interactive command execution with timeouts and working directory support, strict safety guardrails, ephemeral auto-purging, and machine-readable `--json` output across all operations.
+
+---
+
+## Agentic Era Sandboxing (`spin` | `run` | `down`)
+
+AI coding agents and autonomous workflows require predictable, isolated, and safe execution environments. `vmpod` provides three purpose-built primitives with strict guardrails:
+
+```
++-------------------------------------------------------------------------------------------------+
+| AGENTIC LIFECYCLE WORKFLOW                                                                      |
+|                                                                                                 |
+|   1. vmpod spin <NAME> [--ephemeral] [--json]                                                   |
+|      - Allocates container, KVM passthrough, private SSH key                                    |
+|      - Actively probes guest kernel + SSH daemon until 100% ready to execute code               |
+|      - Returns { "status": "ready", "name": ..., "port": ..., "boot_time_ms": ... }             |
+|                                                                                                 |
+|   2. vmpod run <NAME> <COMMAND...> [--workdir <DIR>] [--env KEY=VAL] [--timeout <SEC>] [--json] |
+|      - Non-interactive SSH execution inside isolated guest VM                                   |
+|      - Captures stdout, stderr, exit_code, and execution duration in ms                         |
+|      - Enforces execution timeout guardrails (auto-kills stuck commands with exit code 124)     |
+|                                                                                                 |
+|   3. vmpod down <NAME> [--purge] [--json]                                                       |
+|      - Gracefully terminates QEMU and removes container                                         |
+|      - Auto-purges host disk overlay for ephemeral VMs or when --purge is specified            |
++-------------------------------------------------------------------------------------------------+
+```
+
+### 1. Synchronously Boot a Ready VM (`vmpod spin`)
+Unlike standard container or VM boots where the hypervisor starts before the guest OS has finished mounting filesystems, `vmpod spin` actively probes the VM over TCP and SSH until it is 100% ready to accept commands:
+
+```bash
+# Agent spins an ephemeral VM and parses JSON
+vmpod spin agent-sandbox --ephemeral --json
+```
+
+**JSON Output:**
+```json
+{
+  "status": "ready",
+  "name": "agent-sandbox",
+  "port": 2222,
+  "boot_time_ms": 11200,
+  "storage": "/home/kevin/vmpod-data/agent-sandbox",
+  "ephemeral": true,
+  "ssh_command": "ssh root@localhost -p 2222"
+}
+```
+
+### 2. Execute Code Inside the VM (`vmpod run`)
+Agents run non-interactive commands directly inside the VM without shell escaping issues:
+
+```bash
+# Basic execution with structured JSON
+vmpod run agent-sandbox --json uname -a
+
+# Multi-word commands with custom work directory and environment variables
+vmpod run agent-sandbox --workdir /workspace --env TARGET=prod --json "cargo test --release"
+
+# Timeout guardrail protection (kills process if it exceeds 10s)
+vmpod run agent-sandbox --timeout 10 --json "make build"
+```
+
+**JSON Output:**
+```json
+{
+  "instance": "agent-sandbox",
+  "command": "uname -a",
+  "exit_code": 0,
+  "stdout": "Linux localhost 6.6.121-0-virt #1-Alpine SMP PREEMPT_DYNAMIC x86_64 Linux\n",
+  "stderr": "",
+  "duration_ms": 105,
+  "timed_out": false
+}
+```
+
+### 3. Terminate and Clean Up (`vmpod down`)
+Ephemeral VMs automatically purge their disk overlays upon teardown:
+
+```bash
+vmpod down agent-sandbox --json
+```
+
+**JSON Output:**
+```json
+{
+  "status": "terminated",
+  "name": "agent-sandbox",
+  "purged": true
+}
+```
+
+---
+
+## Safety Guardrails
+
+To protect host machines and workstations when autonomous agents generate infrastructure requests:
+
+| Guardrail | Safety Limit | Behavior on Violation |
+| :--- | :--- | :--- |
+| **vCPU Limit (`--smp`)** | Max `32` cores | Fails immediately: `requested X vCPUs exceeds host safety limit of 32` |
+| **Memory Limit (`--ram`)** | Max `64GB` | Fails immediately: `requested RAM 'X' exceeds host safety limit of 64GB` |
+| **Command Timeout (`--timeout`)** | Max `1800s` (30m) | Fails immediately: `timeout Xs exceeds max safety limit of 1800s` |
+| **Name Validation** | `1-64` chars `[a-zA-Z0-9_.-]` | Rejects spaces, shell metacharacters, and empty names |
+| **Ephemeral Auto-Purge** | Auto-clean on down | Prevents host disk exhaustion from runaway agent loops |
 
 ---
 
@@ -222,6 +326,30 @@ vmpod down --all
 
 ## Subcommand Reference
 
+### `vmpod spin [NAME] [OPTIONS]`
+Spin up a VM container and synchronously wait until the guest OS and SSH are 100% ready to execute code (agent-first).
+
+| Argument / Flag | Default | Description |
+| :--- | :--- | :--- |
+| `[NAME]` | `agent-<id>` | Name or unique identifier for the VM container |
+| `--ram <RAM>` | `2G` | Guest RAM allocation (max 64GB) |
+| `--smp <CPUS>` | `2` | Guest vCPU core count (1-32) |
+| `-t, --timeout <SEC>` | `60` | Maximum wait time for guest SSH readiness |
+| `-e, --ephemeral` | `false` | Automatically purge virtual disk on shutdown |
+| `--json` | `false` | Output machine-readable JSON |
+
+### `vmpod run <NAME> <COMMAND...> [OPTIONS]`
+Execute a non-interactive command inside a running VM and return structured output and exit code (agent-first).
+
+| Argument / Flag | Default | Description |
+| :--- | :--- | :--- |
+| `<NAME>` | *required* | Target running VM instance name |
+| `<COMMAND...>` | *required* | Shell command string or argument list to execute |
+| `-w, --workdir <DIR>` | `None` | Working directory inside guest VM |
+| `-e, --env <KEY=VAL>` | `None` | Environment variable(s) to export |
+| `-t, --timeout <SEC>` | `60` | Execution timeout (max 1800s); terminates process on timeout |
+| `--json` | `false` | Output structured JSON with exit code and timing |
+
 ### `vmpod up [NAME] [OPTIONS]`
 Spin up hardware-accelerated virtual machine container(s).
 
@@ -234,12 +362,14 @@ Spin up hardware-accelerated virtual machine container(s).
 | `--smp <CPUS>` | `2` | Guest vCPU core count |
 | `--storage <PATH>` | `./vmpod-data/<NAME>` | Host directory where virtual disk images live |
 | `--image <IMAGE>` | `vmpod/qemu-runner:latest` | Docker image running QEMU |
+| `--ephemeral` | `false` | Tag VM as ephemeral for auto-purging on shutdown |
+| `--json` | `false` | Output machine-readable JSON |
 
 ### `vmpod list` *(aliases: `ls`, `ps`)*
-List all managed virtual machine instances on the host with status, port, uptime, and resource allocations.
+List all managed virtual machine instances on the host with status, port, uptime, and resource allocations (supports `--json`).
 
 ### `vmpod status [NAME]`
-Inspect the detailed status, uptime, storage mounts, and resource allocations of an instance. If `[NAME]` is omitted, displays the global instance table.
+Inspect the detailed status, uptime, storage mounts, and resource allocations of an instance (supports `--json`).
 
 ### `vmpod down [NAMES...] [OPTIONS]`
 Gracefully shut down QEMU (allowing disk caches to flush) and remove containers.
@@ -247,7 +377,9 @@ Gracefully shut down QEMU (allowing disk caches to flush) and remove containers.
 | Argument / Flag | Default | Description |
 | :--- | :--- | :--- |
 | `[NAMES...]` | `vmpod-box` | One or more instance names to tear down |
+| `-p, --purge` | `false` | Permanently delete the instance's virtual disk storage directory |
 | `-a, --all` | `false` | Stop and tear down all managed `vmpod` instances on the host |
+| `--json` | `false` | Output structured JSON result |
 
 ---
 

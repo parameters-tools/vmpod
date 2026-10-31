@@ -235,7 +235,7 @@ impl App {
         if running {
             self.set_status(format!("Stopping VM '{}' (flushing disk)...", name), Color::Yellow);
             tokio::spawn(async move {
-                match orchestrator.down(&name).await {
+                match orchestrator.down(&name, false).await {
                     Ok(_) => {
                         let _ = tx.send(ActionMessage::Status(
                             format!("Successfully stopped VM '{}'.", name),
@@ -262,6 +262,7 @@ impl App {
                     smp: 2,
                     storage: Some(Path::new(&storage_path).to_path_buf()),
                     image: "vmpod/qemu-runner:latest".to_string(),
+                    ephemeral: false,
                 };
                 match orchestrator.up(params).await {
                     Ok(res) => {
@@ -290,7 +291,7 @@ impl App {
         let tx = action_tx.clone();
 
         tokio::spawn(async move {
-            let _ = orchestrator.down(&name).await;
+            let _ = orchestrator.down(&name, true).await;
             let path = Path::new("./vmpod-data").join(&name);
             if path.exists() {
                 let _ = std::fs::remove_dir_all(&path);
@@ -324,6 +325,7 @@ impl App {
                 smp: if smp == 0 { 2 } else { smp },
                 storage: None,
                 image: "vmpod/qemu-runner:latest".to_string(),
+                ephemeral: false,
             };
 
             match orchestrator.up(params).await {
@@ -1147,6 +1149,7 @@ mod tests {
                 ram: "4G".to_string(),
                 smp: "4".to_string(),
                 storage_path: "/home/kevin/vmpod-data/prod-vm".to_string(),
+                ephemeral: false,
             },
             InstanceSummary {
                 name: "backup-vm".to_string(),
@@ -1160,6 +1163,7 @@ mod tests {
                 ram: "2G".to_string(),
                 smp: "2".to_string(),
                 storage_path: "/home/kevin/vmpod-data/backup-vm".to_string(),
+                ephemeral: false,
             },
         ];
         app.selected_index = 0;
@@ -1199,6 +1203,7 @@ mod tests {
                 ram: "2G".to_string(),
                 smp: "2".to_string(),
                 storage_path: "".to_string(),
+                ephemeral: false,
             },
             InstanceSummary {
                 name: "vm-2".to_string(),
@@ -1212,6 +1217,7 @@ mod tests {
                 ram: "2G".to_string(),
                 smp: "2".to_string(),
                 storage_path: "".to_string(),
+                ephemeral: false,
             },
         ];
 
@@ -1302,6 +1308,7 @@ mod tests {
                 ram: "2G".to_string(),
                 smp: "2".to_string(),
                 storage_path: "/data".to_string(),
+                ephemeral: false,
             }];
 
             // Drawing must succeed without panic on any of these resolutions
@@ -1388,6 +1395,7 @@ mod tests {
                 ram: "2G".to_string(),
                 smp: "2".to_string(),
                 storage_path: "/home/kevin/vmpod-data/cluster-1".to_string(),
+                ephemeral: false,
             },
             InstanceSummary {
                 name: "cluster-2".to_string(),
@@ -1401,6 +1409,7 @@ mod tests {
                 ram: "-".to_string(),
                 smp: "-".to_string(),
                 storage_path: "/home/kevin/vmpod-data/cluster-2".to_string(),
+                ephemeral: false,
             },
         ];
         app.selected_index = 0;

@@ -10,11 +10,11 @@ use std::path::PathBuf;
 #[command(
     name = "vmpod",
     author = "vmpod contributors",
-    version = "1.2.0",
+    version = "1.3.0",
     about = "Fast, local-first CLI to spin up and orchestrate hardware-accelerated Linux VMs inside Docker using QEMU/KVM",
     long_about = "vmpod allows you to launch lightweight, hardware-accelerated virtual machines inside Docker containers \
                   with direct KVM pass-through, user-space networking, automatic root credentials provisioning, \
-                  multi-instance orchestration, and an interactive TUI dashboard."
+                  multi-instance orchestration, interactive TUI, and agentic spin/run/down sandboxing."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -23,6 +23,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Spin up a VM and wait until guest OS & SSH are fully ready (agent-first)
+    Spin(SpinArgs),
+    /// Execute a command inside a running VM and return output & exit code (agent-first)
+    Run(RunArgs),
     /// Spin up hardware-accelerated virtual machine container(s)
     Up(UpArgs),
     /// Gracefully stop and remove virtual machine container(s)
@@ -31,10 +35,80 @@ enum Commands {
     Status(StatusArgs),
     /// List all managed virtual machine instances
     #[command(alias = "ls", alias = "ps")]
-    List,
+    List(ListArgs),
     /// Launch the interactive terminal dashboard
     #[command(alias = "tui", alias = "ui")]
     Dashboard,
+}
+
+#[derive(Args, Debug)]
+struct SpinArgs {
+    /// Name for the VM container (positional or auto-generated if omitted)
+    #[arg(value_name = "NAME")]
+    name_pos: Option<String>,
+
+    /// Unique identifier for the VM container (flag)
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
+    /// Host port mapped to the VM's SSH port (auto-allocated if omitted or in use)
+    #[arg(long, value_name = "PORT")]
+    port: Option<u16>,
+
+    /// Guest RAM allocation (e.g. 512M, 2G, 4G)
+    #[arg(long, default_value = "2G", value_name = "RAM")]
+    ram: String,
+
+    /// Guest vCPU core count (1-32)
+    #[arg(long, default_value_t = 2, value_name = "CPUS")]
+    smp: u32,
+
+    /// Host directory where virtual disk images live (defaults to ./vmpod-data/<NAME>)
+    #[arg(long, value_name = "PATH")]
+    storage: Option<PathBuf>,
+
+    /// Docker image running QEMU
+    #[arg(long, default_value = "vmpod/qemu-runner:latest", value_name = "IMAGE")]
+    image: String,
+
+    /// Maximum time in seconds to wait for guest SSH readiness (default: 60)
+    #[arg(short, long, default_value_t = 60, value_name = "SECONDS")]
+    timeout: u64,
+
+    /// Automatically purge virtual disk and storage when the VM is shut down
+    #[arg(short, long)]
+    ephemeral: bool,
+
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct RunArgs {
+    /// Name of the running VM instance
+    #[arg(value_name = "INSTANCE")]
+    name: String,
+
+    /// Command to execute inside the VM
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    command: Vec<String>,
+
+    /// Execution timeout in seconds (default: 60, max: 1800)
+    #[arg(short, long, default_value_t = 60, value_name = "SECONDS")]
+    timeout: u64,
+
+    /// Working directory inside the guest VM
+    #[arg(short, long, value_name = "PATH")]
+    workdir: Option<String>,
+
+    /// Environment variables to set in the guest VM (KEY=VALUE)
+    #[arg(short, long = "env", value_name = "KEY=VALUE")]
+    envs: Vec<String>,
+
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -70,6 +144,14 @@ struct UpArgs {
     /// Docker image running QEMU
     #[arg(long, default_value = "vmpod/qemu-runner:latest", value_name = "IMAGE")]
     image: String,
+
+    /// Automatically purge virtual disk when stopped
+    #[arg(short, long)]
+    ephemeral: bool,
+
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -85,6 +167,21 @@ struct DownArgs {
     /// Stop and tear down all managed vmpod instances on host
     #[arg(short, long)]
     all: bool,
+
+    /// Purge and permanently delete virtual disk and storage from host
+    #[arg(short, long)]
+    purge: bool,
+
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct ListArgs {
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -96,6 +193,10 @@ struct StatusArgs {
     /// Name of the VM instance to inspect (flag)
     #[arg(long, value_name = "NAME")]
     name: Option<String>,
+
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -109,6 +210,87 @@ async fn main() -> Result<()> {
         Commands::Dashboard => {
             tui::run_dashboard(orchestrator).await?;
         }
+
+        Commands::Spin(args) => {
+            let instance_name = args.name.or(args.name_pos).unwrap_or_else(|| {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let id = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    % 100000;
+                format!("agent-{}", id)
+            });
+
+            if !args.json {
+                println!("============================================================");
+                println!(" Spinning Up VM Instance: {} (agentic readiness mode)", instance_name);
+                println!("============================================================");
+                println!("[*] Waiting for Linux guest kernel and SSH daemon readiness...");
+            }
+
+            let params = UpParams {
+                name: instance_name.clone(),
+                port: args.port,
+                ram: args.ram,
+                smp: args.smp,
+                storage: args.storage,
+                image: args.image,
+                ephemeral: args.ephemeral,
+            };
+
+            let spin_res = orchestrator
+                .spin(params, std::time::Duration::from_secs(args.timeout))
+                .await?;
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&spin_res)?);
+            } else {
+                let dur_secs = spin_res.boot_time_ms as f64 / 1000.0;
+                println!("\n[✓] Virtual Machine is fully booted and ready in {:.2}s!", dur_secs);
+                println!("------------------------------------------------------------");
+                println!("  Name:          {}", spin_res.name);
+                println!("  Port:          {}", spin_res.port);
+                println!("  Storage:       {}", spin_res.storage.display());
+                println!("  Ephemeral:     {}", spin_res.ephemeral);
+                println!("  SSH Command:   {}", spin_res.ssh_command);
+                println!("------------------------------------------------------------");
+                println!("Execute commands inside the VM:");
+                println!("  vmpod run {} \"uname -a\"", spin_res.name);
+                println!("------------------------------------------------------------\n");
+            }
+        }
+
+        Commands::Run(args) => {
+            let command_str = args.command.join(" ");
+            let run_res = orchestrator
+                .run_command(
+                    &args.name,
+                    &command_str,
+                    args.workdir.as_deref(),
+                    &args.envs,
+                    std::time::Duration::from_secs(args.timeout),
+                )
+                .await?;
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&run_res)?);
+            } else {
+                if !run_res.stdout.is_empty() {
+                    print!("{}", run_res.stdout);
+                }
+                if !run_res.stderr.is_empty() {
+                    eprint!("{}", run_res.stderr);
+                }
+                if run_res.timed_out {
+                    eprintln!("Error: Command timed out after {}s", args.timeout);
+                }
+                if run_res.exit_code != 0 {
+                    std::process::exit(run_res.exit_code);
+                }
+            }
+        }
+
         Commands::Up(args) => {
             let base_name = args
                 .name
@@ -116,6 +298,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| "vmpod-box".to_string());
 
             let count = args.count.max(1);
+            let mut results = Vec::new();
 
             for i in 1..=count {
                 let instance_name = if count > 1 {
@@ -124,9 +307,11 @@ async fn main() -> Result<()> {
                     base_name.clone()
                 };
 
-                println!("============================================================");
-                println!(" Launching VM Instance: {}", instance_name);
-                println!("============================================================");
+                if !args.json {
+                    println!("============================================================");
+                    println!(" Launching VM Instance: {}", instance_name);
+                    println!("============================================================");
+                }
 
                 // For batch provisioning, if a custom port was provided, increment it for subsequent instances
                 let instance_port = args.port.map(|p| p + (i - 1) as u16);
@@ -146,43 +331,60 @@ async fn main() -> Result<()> {
                     smp: args.smp,
                     storage: instance_storage,
                     image: args.image.clone(),
+                    ephemeral: args.ephemeral,
                 };
 
                 let res = orchestrator.up(params).await?;
 
-                println!("\n[✓] Virtual Machine successfully started!");
-                println!("------------------------------------------------------------");
-                println!("  Name:          {}", res.name);
-                println!("  Container ID:  {} ({})", res.short_id, res.container_id);
-                println!("  Status:        {}", res.status);
-                println!("  Storage Path:  {}", res.storage_path.display());
-                println!("  SSH Command:   {}", res.ssh_command);
-                println!("------------------------------------------------------------");
-                println!("Connect via SSH:");
-                println!("  {}", res.ssh_command);
-                println!("  (Default credentials: user 'root', password 'root')");
-                println!(
-                    "  (Or using private key: ssh -i {}/id_ed25519 root@localhost -p {})\n",
-                    res.storage_path.display(),
-                    res.port
-                );
+                if !args.json {
+                    println!("\n[✓] Virtual Machine successfully started!");
+                    println!("------------------------------------------------------------");
+                    println!("  Name:          {}", res.name);
+                    println!("  Container ID:  {} ({})", res.short_id, res.container_id);
+                    println!("  Status:        {}", res.status);
+                    println!("  Storage Path:  {}", res.storage_path.display());
+                    println!("  SSH Command:   {}", res.ssh_command);
+                    println!("------------------------------------------------------------");
+                    println!("Connect via SSH:");
+                    println!("  {}", res.ssh_command);
+                    println!("  (Default credentials: user 'root', password 'root')");
+                    println!(
+                        "  (Or using private key: ssh -i {}/id_ed25519 root@localhost -p {})\n",
+                        res.storage_path.display(),
+                        res.port
+                    );
+                }
+
+                results.push(res);
+            }
+
+            if args.json {
+                if results.len() == 1 {
+                    println!("{}", serde_json::to_string_pretty(&results[0])?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&results)?);
+                }
             }
         }
 
         Commands::Down(args) => {
             if args.all {
-                println!("============================================================");
-                println!(" Tearing Down ALL vmpod Instances");
-                println!("============================================================");
-                let removed = orchestrator.down_all().await?;
-                if removed.is_empty() {
-                    println!("No active or stopped vmpod instances found on host.");
+                let removed = orchestrator.down_all(args.purge).await?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&removed)?);
                 } else {
-                    for name in &removed {
-                        println!("[✓] Container '{}' stopped and removed.", name);
+                    println!("============================================================");
+                    println!(" Tearing Down ALL vmpod Instances");
+                    println!("============================================================");
+                    if removed.is_empty() {
+                        println!("No active or stopped vmpod instances found on host.");
+                    } else {
+                        for res in &removed {
+                            println!("[✓] Container '{}' stopped (purged storage: {}).", res.name, res.purged);
+                        }
+                        println!("------------------------------------------------------------");
+                        println!("[✓] Teardown complete. {} instance(s) removed.", removed.len());
                     }
-                    println!("------------------------------------------------------------");
-                    println!("[✓] Teardown complete. {} instance(s) removed.", removed.len());
                 }
             } else {
                 let mut targets = args.names;
@@ -195,11 +397,17 @@ async fn main() -> Result<()> {
                 if targets.is_empty() {
                     let active_instances = orchestrator.list_instances().await?;
                     if active_instances.is_empty() {
-                        println!("No active or stopped vmpod instances found on host.");
+                        if args.json {
+                            println!("[]");
+                        } else {
+                            println!("No active or stopped vmpod instances found on host.");
+                        }
                         return Ok(());
                     } else if active_instances.len() == 1 {
                         let sole_name = active_instances[0].name.clone();
-                        println!("[*] No target specified; defaulting to only instance '{}'", sole_name);
+                        if !args.json {
+                            println!("[*] No target specified; defaulting to only instance '{}'", sole_name);
+                        }
                         targets.push(sole_name);
                     } else {
                         let names: Vec<&str> = active_instances.iter().map(|i| i.name.as_str()).collect();
@@ -209,13 +417,27 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                let mut results = Vec::new();
                 for target in targets {
-                    println!("============================================================");
-                    println!(" Tearing Down VM Instance: {}", target);
-                    println!("============================================================");
-                    println!("[*] Gracefully stopping container '{}' (5-second timeout for QEMU disk flush)...", target);
-                    orchestrator.down(&target).await?;
-                    println!("[✓] Container '{}' stopped and removed.", target);
+                    if !args.json {
+                        println!("============================================================");
+                        println!(" Tearing Down VM Instance: {}", target);
+                        println!("============================================================");
+                        println!("[*] Gracefully stopping container '{}' (5-second timeout for QEMU disk flush)...", target);
+                    }
+                    let res = orchestrator.down(&target, args.purge).await?;
+                    if !args.json {
+                        println!("[✓] Container '{}' stopped and removed (purged storage: {}).", target, res.purged);
+                    }
+                    results.push(res);
+                }
+
+                if args.json {
+                    if results.len() == 1 {
+                        println!("{}", serde_json::to_string_pretty(&results[0])?);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&results)?);
+                    }
                 }
             }
         }
@@ -227,70 +449,81 @@ async fn main() -> Result<()> {
                 Some(name) => {
                     let res = orchestrator.status(&name).await?;
 
-                    println!("============================================================");
-                    println!(" Instance Status: {}", res.name);
-                    println!("============================================================");
-                    println!("  Container ID:  {} ({})", res.short_id, res.container_id);
-                    println!(
-                        "  Status:        {}",
-                        if res.running {
-                            format!("● {} (active)", res.status)
-                        } else {
-                            format!("○ {} (inactive)", res.status)
-                        }
-                    );
-                    println!("  Uptime:        {}", res.uptime);
-                    println!("  Image:         {}", res.image);
-
-                    if let (Some(r), Some(s)) = (res.ram, res.smp) {
-                        println!("  Resources:     {} vCPUs, {} RAM", s, r);
-                    }
-
-                    if let Some(bind) = res.storage_bind {
-                        println!("  Storage Bind:  {}", bind);
-                    }
-
-                    if !res.port_mappings.is_empty() {
-                        println!("  Port Mappings:");
-                        for port_map in res.port_mappings {
-                            println!("    - {}", port_map);
-                        }
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&res)?);
                     } else {
-                        println!("  Port Mappings: None");
-                    }
+                        println!("============================================================");
+                        println!(" Instance Status: {}", res.name);
+                        println!("============================================================");
+                        println!("  Container ID:  {} ({})", res.short_id, res.container_id);
+                        println!(
+                            "  Status:        {}",
+                            if res.running {
+                                format!("● {} (active)", res.status)
+                            } else {
+                                format!("○ {} (inactive)", res.status)
+                            }
+                        );
+                        println!("  Uptime:        {}", res.uptime);
+                        println!("  Image:         {}", res.image);
 
-                    if let Some(ssh) = res.ssh_command {
-                        if res.running {
-                            println!("  SSH Command:   {}", ssh);
+                        if let (Some(r), Some(s)) = (res.ram, res.smp) {
+                            println!("  Resources:     {} vCPUs, {} RAM", s, r);
                         }
+
+                        if let Some(bind) = res.storage_bind {
+                            println!("  Storage Bind:  {}", bind);
+                        }
+
+                        if !res.port_mappings.is_empty() {
+                            println!("  Port Mappings:");
+                            for port_map in res.port_mappings {
+                                println!("    - {}", port_map);
+                            }
+                        } else {
+                            println!("  Port Mappings: None");
+                        }
+
+                        if let Some(ssh) = res.ssh_command {
+                            if res.running {
+                                println!("  SSH Command:   {}", ssh);
+                            }
+                        }
+                        println!("------------------------------------------------------------");
                     }
-                    println!("------------------------------------------------------------");
                 }
                 None => {
-                    // When no name is specified, show list of all instances
-                    print_instances_table(&orchestrator).await?;
+                    let instances = orchestrator.list_instances().await?;
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&instances)?);
+                    } else {
+                        print_instances_table(&instances)?;
+                    }
                 }
             }
         }
 
-        Commands::List => {
-            print_instances_table(&orchestrator).await?;
+        Commands::List(args) => {
+            let instances = orchestrator.list_instances().await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&instances)?);
+            } else {
+                print_instances_table(&instances)?;
+            }
         }
     }
 
     Ok(())
 }
 
-async fn print_instances_table(orchestrator: &VmOrchestrator) -> Result<()> {
-    let instances = orchestrator.list_instances().await?;
-
+fn print_instances_table(instances: &[orchestrator::InstanceSummary]) -> Result<()> {
     println!("=========================================================================================================");
     println!(" MANAGED VMPOD INSTANCES");
     println!("=========================================================================================================");
 
     if instances.is_empty() {
         println!("  No active or stopped vmpod instances found.");
-        println!("  Run 'vmpod up' to launch a virtual machine.");
+        println!("  Run 'vmpod up' or 'vmpod spin' to launch a virtual machine.");
         println!("---------------------------------------------------------------------------------------------------------");
         return Ok(());
     }

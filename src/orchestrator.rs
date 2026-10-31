@@ -7,6 +7,7 @@ use bollard::query_parameters::{
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::Docker;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::net::TcpListener;
@@ -23,8 +24,82 @@ pub const LABEL_NAME: &str = "io.vmpod.name";
 pub const LABEL_SSH_PORT: &str = "io.vmpod.ssh_port";
 pub const LABEL_RAM: &str = "io.vmpod.ram";
 pub const LABEL_SMP: &str = "io.vmpod.smp";
+pub const LABEL_EPHEMERAL: &str = "io.vmpod.ephemeral";
+
+pub const MAX_GUARDRAIL_SMP: u32 = 32;
+pub const MAX_GUARDRAIL_RAM_GB: u64 = 64;
+pub const MAX_GUARDRAIL_TIMEOUT_SECS: u64 = 1800;
+
+pub fn validate_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+    if !valid {
+        bail!(
+            "Invalid instance name '{}': must be 1-64 characters and contain only [a-zA-Z0-9_.-].",
+            name
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_smp(smp: u32) -> Result<()> {
+    if smp == 0 {
+        bail!("Invalid vCPU count: --smp must be at least 1 (got 0).");
+    }
+    if smp > MAX_GUARDRAIL_SMP {
+        bail!(
+            "Guardrail violation: requested {} vCPUs exceeds host safety limit of {} vCPUs.",
+            smp,
+            MAX_GUARDRAIL_SMP
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_ram(ram: &str) -> Result<()> {
+    let ram_trim = ram.trim();
+    let (num_part, unit) = ram_trim.split_at(ram_trim.len().saturating_sub(1));
+    let ram_val_gb = if unit.eq_ignore_ascii_case("g") {
+        num_part.parse::<u64>().ok()
+    } else if unit.eq_ignore_ascii_case("m") {
+        num_part.parse::<u64>().ok().map(|m| (m + 1023) / 1024)
+    } else {
+        ram_trim.parse::<u64>().ok()
+    };
+
+    match ram_val_gb {
+        Some(n) if n > 0 && n <= MAX_GUARDRAIL_RAM_GB => Ok(()),
+        Some(n) if n > MAX_GUARDRAIL_RAM_GB => {
+            bail!(
+                "Guardrail violation: requested RAM '{}' exceeds host safety limit of {}GB.",
+                ram,
+                MAX_GUARDRAIL_RAM_GB
+            );
+        }
+        _ => {
+            bail!(
+                "Invalid RAM allocation '{}': expected a positive memory size up to {}GB (e.g. '512M', '2G', '4G').",
+                ram,
+                MAX_GUARDRAIL_RAM_GB
+            );
+        }
+    }
+}
+
+pub fn validate_timeout(timeout_secs: u64) -> Result<()> {
+    if timeout_secs > MAX_GUARDRAIL_TIMEOUT_SECS {
+        bail!(
+            "Guardrail violation: timeout {}s exceeds max safety limit of {}s.",
+            timeout_secs,
+            MAX_GUARDRAIL_TIMEOUT_SECS
+        );
+    }
+    Ok(())
+}
 
 /// Parameters for spinning up a new VM container instance
+#[derive(Debug, Clone)]
 pub struct UpParams {
     pub name: String,
     pub port: Option<u16>,
@@ -32,9 +107,11 @@ pub struct UpParams {
     pub smp: u32,
     pub storage: Option<PathBuf>,
     pub image: String,
+    pub ephemeral: bool,
 }
 
 /// Result returned after a successful `up` operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpResult {
     pub container_id: String,
     pub short_id: String,
@@ -45,7 +122,40 @@ pub struct UpResult {
     pub storage_path: PathBuf,
 }
 
+/// Result returned after a successful `spin` operation (booted & verified ready)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpinResult {
+    pub status: String,
+    pub name: String,
+    pub port: u16,
+    pub boot_time_ms: u128,
+    pub storage: PathBuf,
+    pub ephemeral: bool,
+    pub ssh_command: String,
+}
+
+/// Result of executing a command inside a VM
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunResult {
+    pub instance: String,
+    pub command: String,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u128,
+    pub timed_out: bool,
+}
+
+/// Result of tearing down a VM
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownResult {
+    pub status: String,
+    pub name: String,
+    pub purged: bool,
+}
+
 /// Result returned after inspecting a VM container
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResult {
     pub container_id: String,
     pub short_id: String,
@@ -59,11 +169,11 @@ pub struct StatusResult {
     pub image: String,
     pub ram: Option<String>,
     pub smp: Option<String>,
+    pub ephemeral: bool,
 }
 
 /// Summary of an instance for listing
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceSummary {
     pub name: String,
     pub container_id: String,
@@ -76,6 +186,7 @@ pub struct InstanceSummary {
     pub ram: String,
     pub smp: String,
     pub storage_path: String,
+    pub ephemeral: bool,
 }
 
 /// Orchestrator encapsulating Bollard Docker client interactions and hypervisor pre-flight checks
@@ -254,35 +365,10 @@ impl VmOrchestrator {
         // Step 1: Pre-flight check
         self.preflight_check().await?;
 
-        // Step 1b: Input validations
-        if params.smp == 0 {
-            bail!("Invalid vCPU count: --smp must be at least 1 (got 0).");
-        }
-
-        let valid_name = !params.name.is_empty()
-            && params.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
-        if !valid_name {
-            bail!(
-                "Invalid instance name '{}': only alphanumeric characters, dots, underscores, and hyphens are allowed ([a-zA-Z0-9_.-]+).",
-                params.name
-            );
-        }
-
-        let ram_trim = params.ram.trim();
-        let valid_ram = !ram_trim.is_empty() && {
-            let (num_part, unit) = ram_trim.split_at(ram_trim.len().saturating_sub(1));
-            if unit.eq_ignore_ascii_case("m") || unit.eq_ignore_ascii_case("g") {
-                num_part.parse::<u64>().map(|n| n > 0).unwrap_or(false)
-            } else {
-                ram_trim.parse::<u64>().map(|n| n > 0).unwrap_or(false)
-            }
-        };
-        if !valid_ram {
-            bail!(
-                "Invalid RAM allocation '{}': expected a positive memory size (e.g. '512M', '2G', '4G').",
-                params.ram
-            );
-        }
+        // Step 1b: Input validations & guardrails
+        validate_smp(params.smp)?;
+        validate_name(&params.name)?;
+        validate_ram(&params.ram)?;
 
         // Step 2: Storage path preparation and isolation check
         let canonical_storage = self
@@ -394,6 +480,9 @@ impl VmOrchestrator {
         labels.insert(LABEL_SSH_PORT.to_string(), actual_port.to_string());
         labels.insert(LABEL_RAM.to_string(), params.ram.clone());
         labels.insert(LABEL_SMP.to_string(), params.smp.to_string());
+        if params.ephemeral {
+            labels.insert(LABEL_EPHEMERAL.to_string(), "true".to_string());
+        }
 
         let container_config = ContainerCreateBody {
             image: Some(params.image.clone()),
@@ -501,83 +590,312 @@ impl VmOrchestrator {
         Ok(output)
     }
 
-    /// Gracefully stop the VM container with 5-second timeout and remove it
-    pub async fn down(&self, name: &str) -> Result<()> {
+    /// Wait for VM guest SSH daemon to accept connections and authenticate
+    pub async fn wait_for_ssh_ready(
+        &self,
+        port: u16,
+        key_path: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<std::time::Duration> {
+        let start = std::time::Instant::now();
+        let interval = std::time::Duration::from_millis(500);
+
+        while start.elapsed() < timeout {
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+
+                let output = tokio::process::Command::new("ssh")
+                    .arg("-i").arg(key_path)
+                    .arg("-o").arg("BatchMode=yes")
+                    .arg("-o").arg("StrictHostKeyChecking=no")
+                    .arg("-o").arg("UserKnownHostsFile=/dev/null")
+                    .arg("-o").arg("LogLevel=ERROR")
+                    .arg("-o").arg("ConnectTimeout=2")
+                    .arg("-p").arg(port.to_string())
+                    .arg("root@127.0.0.1")
+                    .arg("true")
+                    .output()
+                    .await;
+
+                if let Ok(out) = output {
+                    if out.status.success() {
+                        return Ok(start.elapsed());
+                    }
+                }
+            }
+
+            tokio::time::sleep(interval).await;
+        }
+
+        bail!(
+            "Timeout waiting for VM SSH readiness on port {} after {}s.",
+            port,
+            timeout.as_secs()
+        );
+    }
+
+    /// Spin up a VM and block until the guest OS and SSH are 100% ready to execute commands
+    pub async fn spin(
+        &self,
+        params: UpParams,
+        readiness_timeout: std::time::Duration,
+    ) -> Result<SpinResult> {
+        let name = params.name.clone();
+        let ephemeral = params.ephemeral;
+        let up_res = self.up(params).await?;
+
+        let key_path = up_res.storage_path.join("id_ed25519");
+        let boot_duration = match self
+            .wait_for_ssh_ready(up_res.port, &key_path, readiness_timeout)
+            .await
+        {
+            Ok(dur) => dur,
+            Err(e) => {
+                if ephemeral {
+                    let _ = self.down(&name, true).await;
+                }
+                return Err(e);
+            }
+        };
+
+        Ok(SpinResult {
+            status: "ready".to_string(),
+            name: up_res.name,
+            port: up_res.port,
+            boot_time_ms: boot_duration.as_millis(),
+            storage: up_res.storage_path,
+            ephemeral,
+            ssh_command: up_res.ssh_command,
+        })
+    }
+
+    /// Execute a command non-interactively inside the VM over SSH with timeout protection
+    pub async fn run_command(
+        &self,
+        name: &str,
+        command: &str,
+        workdir: Option<&str>,
+        envs: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<RunResult> {
+        validate_timeout(timeout.as_secs())?;
+
+        let instances = self.list_instances().await?;
+        let inst = instances
+            .iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+
+        if !inst.running {
+            bail!(
+                "VM instance '{}' is not currently running. Run 'vmpod up {}' or 'vmpod spin {}' first.",
+                name,
+                name,
+                name
+            );
+        }
+
+        let port = inst
+            .port
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' has no SSH port mapping.", name))?;
+        let key_path = PathBuf::from(&inst.storage_path).join("id_ed25519");
+
+        // Format command with environment variables and workdir if requested
+        let mut script = String::new();
+        for env in envs {
+            if let Some((k, v)) = env.split_once('=') {
+                script.push_str(&format!("export {}='{}' && ", k, v.replace('\'', "'\\''")));
+            }
+        }
+        if let Some(wd) = workdir {
+            script.push_str(&format!("mkdir -p '{}' && cd '{}' && ", wd, wd));
+        }
+        script.push_str(command);
+
+        let start = std::time::Instant::now();
+
+        let mut child = tokio::process::Command::new("ssh")
+            .arg("-i").arg(&key_path)
+            .arg("-o").arg("BatchMode=yes")
+            .arg("-o").arg("StrictHostKeyChecking=no")
+            .arg("-o").arg("UserKnownHostsFile=/dev/null")
+            .arg("-o").arg("LogLevel=ERROR")
+            .arg("-o").arg("ConnectTimeout=5")
+            .arg("-p").arg(port.to_string())
+            .arg("root@127.0.0.1")
+            .arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("Failed to spawn ssh process")?;
+
+        let mut stdout_pipe = child.stdout.take().context("Failed to open child stdout")?;
+        let mut stderr_pipe = child.stderr.take().context("Failed to open child stderr")?;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+
+        let timeout_result = tokio::time::timeout(timeout, async {
+            let (out_res, err_res, status_res) = tokio::join!(
+                tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut stdout_bytes),
+                tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut stderr_bytes),
+                child.wait()
+            );
+            match (out_res, err_res, status_res) {
+                (Ok(_), Ok(_), Ok(status)) => Ok(status),
+                (Err(e), _, _) | (_, Err(e), _) => Err(anyhow::anyhow!(e)),
+                (_, _, Err(e)) => Err(anyhow::anyhow!(e)),
+            }
+        }).await;
+        let duration = start.elapsed();
+
+        match timeout_result {
+            Ok(Ok(status)) => {
+                let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+                let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+                let exit_code = status.code().unwrap_or(-1);
+
+                Ok(RunResult {
+                    instance: name.to_string(),
+                    command: command.to_string(),
+                    exit_code,
+                    stdout,
+                    stderr,
+                    duration_ms: duration.as_millis(),
+                    timed_out: false,
+                })
+            }
+            Ok(Err(e)) => Err(e).context("Failed waiting for command execution"),
+            Err(_) => {
+                let _ = child.start_kill();
+                Ok(RunResult {
+                    instance: name.to_string(),
+                    command: command.to_string(),
+                    exit_code: 124,
+                    stdout: String::new(),
+                    stderr: format!("Command timed out after {}s", timeout.as_secs()),
+                    duration_ms: duration.as_millis(),
+                    timed_out: true,
+                })
+            }
+        }
+    }
+
+    /// Gracefully stop the VM container and remove it.
+    /// If `purge` is true or if the container is labeled ephemeral, deletes host storage.
+    pub async fn down(&self, name: &str, purge: bool) -> Result<DownResult> {
         let inspect = match self
             .docker
             .inspect_container(name, None::<InspectContainerOptions>)
             .await
         {
-            Ok(res) => res,
+            Ok(res) => Some(res),
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
-            }) => {
-                bail!("VM container '{}' not found.", name);
-            }
+            }) => None,
             Err(e) => return Err(e).context("Error inspecting container"),
         };
 
-        let is_running = inspect
-            .state
-            .as_ref()
-            .and_then(|s| s.running)
-            .unwrap_or(false);
+        let mut is_ephemeral = false;
+        let mut storage_path_to_purge: Option<PathBuf> = None;
 
-        if is_running {
+        if let Some(ref c) = inspect {
+            is_ephemeral = c
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.labels.as_ref())
+                .and_then(|l| l.get(LABEL_EPHEMERAL))
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
+            if let Some(mounts) = c.mounts.as_ref() {
+                for m in mounts {
+                    if m.destination == Some("/storage".to_string()) {
+                        if let Some(src) = m.source.as_ref() {
+                            storage_path_to_purge = Some(PathBuf::from(src));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let is_running = c
+                .state
+                .as_ref()
+                .and_then(|s| s.running)
+                .unwrap_or(false);
+
+            if is_running {
+                if let Err(e) = self
+                    .docker
+                    .stop_container(
+                        name,
+                        Some(StopContainerOptions {
+                            signal: None,
+                            t: Some(5),
+                        }),
+                    )
+                    .await
+                {
+                    match &e {
+                        bollard::errors::Error::DockerResponseServerError {
+                            status_code: 304, ..
+                        } => {}
+                        _ => return Err(e).context(format!("Failed to stop container '{name}'")),
+                    }
+                }
+            }
+
             if let Err(e) = self
                 .docker
-                .stop_container(
+                .remove_container(
                     name,
-                    Some(StopContainerOptions {
-                        signal: None,
-                        t: Some(5),
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
                     }),
                 )
                 .await
             {
                 match &e {
                     bollard::errors::Error::DockerResponseServerError {
-                        status_code: 304, ..
-                    } => {
-                        // Container already stopped concurrently
-                    }
-                    _ => return Err(e).context(format!("Failed to stop container '{name}'")),
+                        status_code: 404, ..
+                    } => {}
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 409,
+                        message,
+                    } if message.contains("removal") && message.contains("in progress") => {}
+                    _ => return Err(e).context(format!("Failed to remove container '{name}'")),
                 }
             }
         }
 
-        if let Err(e) = self
-            .docker
-            .remove_container(
-                name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            match &e {
-                bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404, ..
-                } => {
-                    // Container was already removed
-                }
-                bollard::errors::Error::DockerResponseServerError {
-                    status_code: 409,
-                    message,
-                } if message.contains("removal") && message.contains("in progress") => {
-                    // Container removal is already in progress
-                }
-                _ => return Err(e).context(format!("Failed to remove container '{name}'")),
+        if storage_path_to_purge.is_none() {
+            let fallback = PathBuf::from("./vmpod-data").join(name);
+            if fallback.exists() {
+                storage_path_to_purge = Some(fallback);
             }
         }
 
-        Ok(())
+        let mut actually_purged = false;
+        if (purge || is_ephemeral) && storage_path_to_purge.is_some() {
+            let p = storage_path_to_purge.unwrap();
+            if p.exists() {
+                let _ = std::fs::remove_dir_all(&p);
+                actually_purged = true;
+            }
+        } else if inspect.is_none() && !purge {
+            bail!("VM container '{}' not found.", name);
+        }
+
+        Ok(DownResult {
+            status: "terminated".to_string(),
+            name: name.to_string(),
+            purged: actually_purged,
+        })
     }
 
     /// Gracefully stop and remove all managed vmpod instances
-    pub async fn down_all(&self) -> Result<Vec<String>> {
+    pub async fn down_all(&self, purge: bool) -> Result<Vec<DownResult>> {
         let instances = self.list_instances().await?;
         if instances.is_empty() {
             return Ok(Vec::new());
@@ -585,8 +903,8 @@ impl VmOrchestrator {
 
         let mut removed = Vec::new();
         for inst in instances {
-            if self.down(&inst.name).await.is_ok() {
-                removed.push(inst.name);
+            if let Ok(res) = self.down(&inst.name, purge).await {
+                removed.push(res);
             }
         }
         Ok(removed)
@@ -700,6 +1018,11 @@ impl VmOrchestrator {
                 "stopped".to_string()
             };
 
+            let ephemeral = labels
+                .get(LABEL_EPHEMERAL)
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
             instances.push(InstanceSummary {
                 name,
                 container_id,
@@ -712,6 +1035,7 @@ impl VmOrchestrator {
                 ram,
                 smp,
                 storage_path,
+                ephemeral,
             });
         }
 
@@ -737,6 +1061,7 @@ impl VmOrchestrator {
                                 ram: "-".to_string(),
                                 smp: "-".to_string(),
                                 storage_path: canonical.to_string_lossy().to_string(),
+                                ephemeral: false,
                             });
                         }
                     }
@@ -826,6 +1151,10 @@ impl VmOrchestrator {
         let labels = config.labels.unwrap_or_default();
         let ram = labels.get(LABEL_RAM).cloned();
         let smp = labels.get(LABEL_SMP).cloned();
+        let ephemeral = labels
+            .get(LABEL_EPHEMERAL)
+            .map(|v| v == "true")
+            .unwrap_or(false);
 
         Ok(StatusResult {
             container_id,
@@ -840,6 +1169,7 @@ impl VmOrchestrator {
             image,
             ram,
             smp,
+            ephemeral,
         })
     }
 }
@@ -910,4 +1240,111 @@ fn calculate_uptime(iso8601: &str) -> String {
     }
 
     "running".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_name() {
+        assert!(validate_name("agent-1").is_ok());
+        assert!(validate_name("test_vm.01").is_ok());
+        assert!(validate_name("vmpod-box").is_ok());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("name with spaces").is_err());
+        assert!(validate_name("bad/slash").is_err());
+        assert!(validate_name("bad:colon").is_err());
+        assert!(validate_name(&"a".repeat(65)).is_err());
+        assert!(validate_name(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_smp() {
+        assert!(validate_smp(1).is_ok());
+        assert!(validate_smp(2).is_ok());
+        assert!(validate_smp(32).is_ok());
+        assert!(validate_smp(0).is_err());
+        assert!(validate_smp(33).is_err());
+        assert!(validate_smp(64).is_err());
+    }
+
+    #[test]
+    fn test_validate_ram() {
+        assert!(validate_ram("512M").is_ok());
+        assert!(validate_ram("1G").is_ok());
+        assert!(validate_ram("2g").is_ok());
+        assert!(validate_ram("64G").is_ok());
+        assert!(validate_ram("0G").is_err());
+        assert!(validate_ram("65G").is_err());
+        assert!(validate_ram("128G").is_err());
+        assert!(validate_ram("not_a_number").is_err());
+    }
+
+    #[test]
+    fn test_validate_timeout() {
+        assert!(validate_timeout(1).is_ok());
+        assert!(validate_timeout(60).is_ok());
+        assert!(validate_timeout(1800).is_ok());
+        assert!(validate_timeout(1801).is_err());
+        assert!(validate_timeout(3600).is_err());
+    }
+
+    #[test]
+    fn test_serde_spin_result() {
+        let res = SpinResult {
+            status: "ready".into(),
+            name: "agent-1".into(),
+            port: 2222,
+            boot_time_ms: 8500,
+            storage: PathBuf::from("./vmpod-data/agent-1"),
+            ephemeral: true,
+            ssh_command: "ssh root@127.0.0.1 -p 2222".into(),
+        };
+        let json_str = serde_json::to_string(&res).expect("serialization failed");
+        assert!(json_str.contains("\"status\":\"ready\""));
+        assert!(json_str.contains("\"ephemeral\":true"));
+        assert!(json_str.contains("\"boot_time_ms\":8500"));
+
+        let de: SpinResult = serde_json::from_str(&json_str).expect("deserialization failed");
+        assert_eq!(de.name, "agent-1");
+        assert_eq!(de.boot_time_ms, 8500);
+        assert!(de.ephemeral);
+    }
+
+    #[test]
+    fn test_serde_run_result() {
+        let res = RunResult {
+            instance: "agent-1".into(),
+            command: "uname -a".into(),
+            exit_code: 0,
+            stdout: "Linux vmpod 6.6.0\n".into(),
+            stderr: String::new(),
+            duration_ms: 120,
+            timed_out: false,
+        };
+        let json_str = serde_json::to_string(&res).expect("serialization failed");
+        assert!(json_str.contains("\"exit_code\":0"));
+        assert!(json_str.contains("\"timed_out\":false"));
+
+        let de: RunResult = serde_json::from_str(&json_str).expect("deserialization failed");
+        assert_eq!(de.exit_code, 0);
+        assert_eq!(de.instance, "agent-1");
+    }
+
+    #[test]
+    fn test_serde_down_result() {
+        let res = DownResult {
+            status: "stopped".into(),
+            name: "agent-1".into(),
+            purged: true,
+        };
+        let json_str = serde_json::to_string(&res).expect("serialization failed");
+        assert!(json_str.contains("\"purged\":true"));
+        assert!(json_str.contains("\"status\":\"stopped\""));
+
+        let de: DownResult = serde_json::from_str(&json_str).expect("deserialization failed");
+        assert_eq!(de.name, "agent-1");
+        assert!(de.purged);
+    }
 }
