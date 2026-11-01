@@ -1,14 +1,47 @@
-# vmpod (v1.3.0)
+# vmpod (v1.4.0)
 
 [![Rust Version](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/docker-bollard%20client-2496ED.svg)](https://github.com/fussybeaver/bollard)
 [![Hypervisor](https://img.shields.io/badge/hypervisor-QEMU%20%2B%20KVM-red.svg)](https://www.qemu.org/)
 [![TUI](https://img.shields.io/badge/tui-ratatui%20%2B%20crossterm-brightgreen.svg)](https://github.com/ratatui/ratatui)
+[![MCP](https://img.shields.io/badge/protocol-Model%20Context%20Protocol-purple.svg)](https://modelcontextprotocol.io/)
 
 **vmpod** is a fast, local-first, zero-dependency CLI and sandbox engine written in Rust that spins up and orchestrates hardware-accelerated Linux virtual machines running inside Docker containers using **QEMU** and **KVM**.
 
-Version **1.3.0** introduces the **Agentic Era Engine**: specialized agent-first subcommands (`spin`, `run`, `down`), synchronous readiness probing, non-interactive command execution with timeouts and working directory support, strict safety guardrails, ephemeral auto-purging, and machine-readable `--json` output across all operations.
+Version **1.4.0** introduces a **Native Model Context Protocol (MCP) Server** alongside the Agentic Era Engine (`spin`, `run`, `down`), allowing AI assistants (Claude Desktop, Cursor, Antigravity, Windsurf, Zed) to connect directly via JSON-RPC 2.0 and securely manage isolated sandbox VMs with typed tools, file transfers, and safety guardrails.
+
+---
+
+## Native Model Context Protocol (MCP) Server (`vmpod mcp`)
+
+`vmpod` turns your local machine into a high-performance, hardware-isolated sandbox provider for AI coding assistants. Connect any MCP-compliant client to `vmpod mcp` over `stdio` to give your AI assistants isolated execution environments without granting them host shell access.
+
+### Claude Desktop / Cursor / Antigravity Configuration
+Add `vmpod` to your client configuration file (`claude_desktop_config.json` or MCP settings):
+
+```json
+{
+  "mcpServers": {
+    "vmpod": {
+      "command": "vmpod",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Tools Exposed to AI Assistants:
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| **`vmpod_spin`** | `name`, `ram`, `smp`, `ephemeral`, `timeout` | Boots a dedicated Linux VM with KVM and probes readiness until 100% ready. |
+| **`vmpod_run`** | `name`, `command`, `workdir`, `env`, `timeout` | Executes a non-interactive shell command and returns `{ exit_code, stdout, stderr, duration_ms }`. |
+| **`vmpod_write_file`** | `name`, `path`, `content` | Writes a file or script directly into the guest VM filesystem. |
+| **`vmpod_read_file`** | `name`, `path` | Reads files, logs, or build artifacts from inside the VM back to the model. |
+| **`vmpod_status`** | `name` | Inspects uptime, memory, vCPUs, and SSH port mappings. |
+| **`vmpod_list`** | *(none)* | Lists all active and stopped sandbox VMs. |
+| **`vmpod_down`** | `name`, `purge` | Terminates VM and automatically purges disk overlays if ephemeral. |
 
 ---
 
@@ -349,6 +382,9 @@ Execute a non-interactive command inside a running VM and return structured outp
 | `-e, --env <KEY=VAL>` | `None` | Environment variable(s) to export |
 | `-t, --timeout <SEC>` | `60` | Execution timeout (max 1800s); terminates process on timeout |
 | `--json` | `false` | Output structured JSON with exit code and timing |
+
+### `vmpod mcp`
+Launch the native Model Context Protocol (MCP) JSON-RPC 2.0 server over `stdio`. Exposes typed sandbox tools to Claude Desktop, Cursor, Antigravity, and other AI assistants.
 
 ### `vmpod up [NAME] [OPTIONS]`
 Spin up hardware-accelerated virtual machine container(s).

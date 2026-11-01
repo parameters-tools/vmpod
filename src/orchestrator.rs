@@ -605,6 +605,7 @@ impl VmOrchestrator {
                 let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
 
                 let output = tokio::process::Command::new("ssh")
+                    .arg("-n")
                     .arg("-i").arg(key_path)
                     .arg("-o").arg("BatchMode=yes")
                     .arg("-o").arg("StrictHostKeyChecking=no")
@@ -614,6 +615,7 @@ impl VmOrchestrator {
                     .arg("-p").arg(port.to_string())
                     .arg("root@127.0.0.1")
                     .arg("true")
+                    .stdin(std::process::Stdio::null())
                     .output()
                     .await;
 
@@ -715,6 +717,7 @@ impl VmOrchestrator {
         let start = std::time::Instant::now();
 
         let mut child = tokio::process::Command::new("ssh")
+            .arg("-n")
             .arg("-i").arg(&key_path)
             .arg("-o").arg("BatchMode=yes")
             .arg("-o").arg("StrictHostKeyChecking=no")
@@ -724,6 +727,7 @@ impl VmOrchestrator {
             .arg("-p").arg(port.to_string())
             .arg("root@127.0.0.1")
             .arg(&script)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -778,6 +782,109 @@ impl VmOrchestrator {
                 })
             }
         }
+    }
+
+    /// Write file contents directly to a path inside the VM via SSH stdin.
+    pub async fn write_file(&self, name: &str, path: &str, content: &[u8]) -> Result<()> {
+        let instances = self.list_instances().await?;
+        let inst = instances
+            .iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+
+        if !inst.running {
+            bail!("VM instance '{}' is not currently running.", name);
+        }
+
+        let port = inst
+            .port
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' has no SSH port mapping.", name))?;
+        let key_path = PathBuf::from(&inst.storage_path).join("id_ed25519");
+
+        let escaped_path = path.replace('\'', "'\\''");
+        let shell_cmd = format!("mkdir -p \"$(dirname '{}')\" && cat > '{}'", escaped_path, escaped_path);
+
+        let mut child = tokio::process::Command::new("ssh")
+            .arg("-i").arg(&key_path)
+            .arg("-o").arg("BatchMode=yes")
+            .arg("-o").arg("StrictHostKeyChecking=no")
+            .arg("-o").arg("UserKnownHostsFile=/dev/null")
+            .arg("-o").arg("LogLevel=ERROR")
+            .arg("-o").arg("ConnectTimeout=5")
+            .arg("-p").arg(port.to_string())
+            .arg("root@127.0.0.1")
+            .arg(&shell_cmd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("Failed to spawn ssh for write_file")?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            tokio::io::AsyncWriteExt::write_all(&mut stdin, content)
+                .await
+                .context("Failed to write content to ssh stdin")?;
+            tokio::io::AsyncWriteExt::flush(&mut stdin)
+                .await
+                .context("Failed to flush ssh stdin")?;
+            drop(stdin);
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .context("Failed to wait for write_file completion")?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to write file inside VM: {}", err.trim());
+        }
+
+        Ok(())
+    }
+
+    /// Read file contents from inside the VM via SSH.
+    pub async fn read_file(&self, name: &str, path: &str) -> Result<String> {
+        let instances = self.list_instances().await?;
+        let inst = instances
+            .iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+
+        if !inst.running {
+            bail!("VM instance '{}' is not currently running.", name);
+        }
+
+        let port = inst
+            .port
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' has no SSH port mapping.", name))?;
+        let key_path = PathBuf::from(&inst.storage_path).join("id_ed25519");
+
+        let escaped_path = path.replace('\'', "'\\''");
+        let shell_cmd = format!("cat '{}'", escaped_path);
+
+        let output = tokio::process::Command::new("ssh")
+            .arg("-n")
+            .arg("-i").arg(&key_path)
+            .arg("-o").arg("BatchMode=yes")
+            .arg("-o").arg("StrictHostKeyChecking=no")
+            .arg("-o").arg("UserKnownHostsFile=/dev/null")
+            .arg("-o").arg("LogLevel=ERROR")
+            .arg("-o").arg("ConnectTimeout=5")
+            .arg("-p").arg(port.to_string())
+            .arg("root@127.0.0.1")
+            .arg(&shell_cmd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .context("Failed to execute ssh for read_file")?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to read file '{}': {}", path, err.trim());
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     /// Gracefully stop the VM container and remove it.

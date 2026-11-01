@@ -1,3 +1,4 @@
+mod mcp;
 mod orchestrator;
 mod tui;
 
@@ -10,11 +11,11 @@ use std::path::PathBuf;
 #[command(
     name = "vmpod",
     author = "vmpod contributors",
-    version = "1.3.0",
+    version = "1.4.0",
     about = "Fast, local-first CLI to spin up and orchestrate hardware-accelerated Linux VMs inside Docker using QEMU/KVM",
     long_about = "vmpod allows you to launch lightweight, hardware-accelerated virtual machines inside Docker containers \
                   with direct KVM pass-through, user-space networking, automatic root credentials provisioning, \
-                  multi-instance orchestration, interactive TUI, and agentic spin/run/down sandboxing."
+                  multi-instance orchestration, interactive TUI, agentic spin/run/down sandboxing, and native Model Context Protocol (MCP) support."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,6 +28,8 @@ enum Commands {
     Spin(SpinArgs),
     /// Execute a command inside a running VM and return output & exit code (agent-first)
     Run(RunArgs),
+    /// Launch the Model Context Protocol (MCP) JSON-RPC server on stdio (agent-first)
+    Mcp,
     /// Spin up hardware-accelerated virtual machine container(s)
     Up(UpArgs),
     /// Gracefully stop and remove virtual machine container(s)
@@ -209,6 +212,10 @@ async fn main() -> Result<()> {
     match command {
         Commands::Dashboard => {
             tui::run_dashboard(orchestrator).await?;
+        }
+
+        Commands::Mcp => {
+            mcp::run_mcp_server(orchestrator).await?;
         }
 
         Commands::Spin(args) => {
