@@ -11,11 +11,12 @@ use std::path::PathBuf;
 #[command(
     name = "vmpod",
     author = "vmpod contributors",
-    version = "1.4.0",
+    version = "1.5.0",
     about = "Fast, local-first CLI to spin up and orchestrate hardware-accelerated Linux VMs inside Docker using QEMU/KVM",
     long_about = "vmpod allows you to launch lightweight, hardware-accelerated virtual machines inside Docker containers \
                   with direct KVM pass-through, user-space networking, automatic root credentials provisioning, \
-                  multi-instance orchestration, interactive TUI, agentic spin/run/down sandboxing, and native Model Context Protocol (MCP) support."
+                  multi-instance orchestration, interactive TUI, agentic spin/run/down sandboxing, native Model Context Protocol (MCP) support, \
+                  and instant QCOW2 point-in-time snapshot & rollback."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,6 +31,11 @@ enum Commands {
     Run(RunArgs),
     /// Launch the Model Context Protocol (MCP) JSON-RPC server on stdio (agent-first)
     Mcp,
+    /// Manage point-in-time snapshots of virtual disks
+    #[command(subcommand)]
+    Snapshot(SnapshotCommands),
+    /// Revert a VM back to a named snapshot
+    Rollback(RollbackArgs),
     /// Spin up hardware-accelerated virtual machine container(s)
     Up(UpArgs),
     /// Gracefully stop and remove virtual machine container(s)
@@ -202,6 +208,62 @@ struct StatusArgs {
     json: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum SnapshotCommands {
+    /// Create a new point-in-time snapshot of a VM's virtual disk
+    Create(SnapshotCreateArgs),
+    /// List all snapshots on a VM's virtual disk
+    #[command(alias = "ls")]
+    List(SnapshotListArgs),
+    /// Revert a VM back to a named snapshot
+    Rollback(RollbackArgs),
+    /// Delete a named snapshot from a VM's virtual disk
+    #[command(alias = "rm")]
+    Delete(SnapshotDeleteArgs),
+}
+
+#[derive(Args, Debug)]
+struct SnapshotCreateArgs {
+    /// Target VM instance name
+    name: String,
+    /// Name or tag for the snapshot
+    tag: String,
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct SnapshotListArgs {
+    /// Target VM instance name
+    name: String,
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct RollbackArgs {
+    /// Target VM instance name
+    name: String,
+    /// Name or tag of the snapshot to revert to
+    tag: String,
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct SnapshotDeleteArgs {
+    /// Target VM instance name
+    name: String,
+    /// Name or tag of the snapshot to delete
+    tag: String,
+    /// Output structured JSON
+    #[arg(long)]
+    json: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -217,6 +279,79 @@ async fn main() -> Result<()> {
         Commands::Mcp => {
             mcp::run_mcp_server(orchestrator).await?;
         }
+
+        Commands::Rollback(args) => {
+            if !args.json {
+                println!("============================================================");
+                println!(" Rolling Back VM: {} -> '{}'", args.name, args.tag);
+                println!("============================================================");
+                println!("[*] Reverting virtual disk to checkpoint '{}'...", args.tag);
+            }
+
+            let res = orchestrator.snapshot_rollback(&args.name, &args.tag).await?;
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                println!("[✓] VM '{}' successfully reverted to snapshot '{}'!", res.instance, res.snapshot);
+            }
+        }
+
+        Commands::Snapshot(subcmd) => match subcmd {
+            SnapshotCommands::Create(args) => {
+                if !args.json {
+                    println!("============================================================");
+                    println!(" Creating Snapshot for VM: {}", args.name);
+                    println!("============================================================");
+                    println!("[*] Checkpoint tag: '{}'", args.tag);
+                }
+
+                let res = orchestrator.snapshot_create(&args.name, &args.tag).await?;
+
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                } else {
+                    println!("[✓] Snapshot '{}' created successfully for VM '{}'!", res.snapshot, res.instance);
+                }
+            }
+
+            SnapshotCommands::List(args) => {
+                let snapshots = orchestrator.snapshot_list(&args.name).await?;
+
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&snapshots)?);
+                } else {
+                    print_snapshots_table(&args.name, &snapshots);
+                }
+            }
+
+            SnapshotCommands::Rollback(args) => {
+                if !args.json {
+                    println!("============================================================");
+                    println!(" Rolling Back VM: {} -> '{}'", args.name, args.tag);
+                    println!("============================================================");
+                    println!("[*] Reverting virtual disk to checkpoint '{}'...", args.tag);
+                }
+
+                let res = orchestrator.snapshot_rollback(&args.name, &args.tag).await?;
+
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                } else {
+                    println!("[✓] VM '{}' successfully reverted to snapshot '{}'!", res.instance, res.snapshot);
+                }
+            }
+
+            SnapshotCommands::Delete(args) => {
+                let res = orchestrator.snapshot_delete(&args.name, &args.tag).await?;
+
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                } else {
+                    println!("[✓] Snapshot '{}' deleted from VM '{}'.", res.snapshot, res.instance);
+                }
+            }
+        },
 
         Commands::Spin(args) => {
             let instance_name = args.name.or(args.name_pos).unwrap_or_else(|| {
@@ -568,4 +703,25 @@ fn print_instances_table(instances: &[orchestrator::InstanceSummary]) -> Result<
     println!("Use 'vmpod status <NAME>' for details, or 'vmpod down <NAME>' to stop.");
 
     Ok(())
+}
+
+fn print_snapshots_table(vm_name: &str, snapshots: &[orchestrator::SnapshotInfo]) {
+    println!("=========================================================================================================");
+    println!(" SNAPSHOTS FOR VM: {}", vm_name);
+    println!("=========================================================================================================");
+
+    if snapshots.is_empty() {
+        println!("  No snapshots found for VM '{}'.", vm_name);
+        println!("  Run 'vmpod snapshot create {} <TAG>' to create a checkpoint.", vm_name);
+        println!("---------------------------------------------------------------------------------------------------------");
+        return;
+    }
+
+    println!(" {:<8} {:<24} {:<24} {:<16}", "ID", "TAG", "DATE", "SIZE");
+    println!("---------------------------------------------------------------------------------------------------------");
+    for s in snapshots {
+        println!(" {:<8} {:<24} {:<24} {:<16}", s.id, s.tag, s.date, s.vm_size);
+    }
+    println!("---------------------------------------------------------------------------------------------------------");
+    println!("Use 'vmpod rollback {} <TAG>' to revert to a snapshot.", vm_name);
 }

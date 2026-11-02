@@ -477,6 +477,38 @@ impl App {
             KeyCode::Char(' ') | KeyCode::Char('s') => {
                 self.toggle_start_stop(action_tx);
             }
+            KeyCode::Char('c') => {
+                if let Some(inst) = self.selected_instance() {
+                    let name = inst.name.clone();
+                    let orch = self.orchestrator.clone();
+                    let tag = format!(
+                        "snap-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                            % 100000
+                    );
+                    let tx = action_tx.clone();
+                    self.set_status(&format!("Creating snapshot '{}' for '{}'...", tag, name), Color::Yellow);
+                    tokio::spawn(async move {
+                        match orch.snapshot_create(&name, &tag).await {
+                            Ok(_) => {
+                                let _ = tx.send(ActionMessage::Status(
+                                    format!("Snapshot '{}' created for '{}'!", tag, name),
+                                    Color::Green,
+                                ));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ActionMessage::Status(
+                                    format!("Failed to create snapshot: {:#}", e),
+                                    Color::Red,
+                                ));
+                            }
+                        }
+                    });
+                }
+            }
             KeyCode::Char('n') => {
                 let default_name = format!("vm-{}", self.instances.len() + 1);
                 self.dialog = Some(Dialog::NewVm {
@@ -568,6 +600,8 @@ impl App {
             Span::raw("SSH "),
             Span::styled("[Space] ", Style::default().fg(Color::Cyan).bold()),
             Span::raw("Power "),
+            Span::styled("[C] ", Style::default().fg(Color::Cyan).bold()),
+            Span::raw("Snap "),
             Span::styled("[N] ", Style::default().fg(Color::Cyan).bold()),
             Span::raw("New "),
             Span::styled("[D] ", Style::default().fg(Color::Cyan).bold()),

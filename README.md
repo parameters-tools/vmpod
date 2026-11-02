@@ -1,4 +1,4 @@
-# vmpod (v1.4.0)
+# vmpod (v1.5.0)
 
 [![Rust Version](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
@@ -9,7 +9,7 @@
 
 **vmpod** is a fast, local-first, zero-dependency CLI and sandbox engine written in Rust that spins up and orchestrates hardware-accelerated Linux virtual machines running inside Docker containers using **QEMU** and **KVM**.
 
-Version **1.4.0** introduces a **Native Model Context Protocol (MCP) Server** alongside the Agentic Era Engine (`spin`, `run`, `down`), allowing AI assistants (Claude Desktop, Cursor, Antigravity, Windsurf, Zed) to connect directly via JSON-RPC 2.0 and securely manage isolated sandbox VMs with typed tools, file transfers, and safety guardrails.
+Version **1.5.0** introduces **Instant Snapshots & Rollbacks** (`vmpod snapshot`, `vmpod rollback`) alongside the Native **Model Context Protocol (MCP) Server** and Agentic Era Engine (`spin`, `run`, `down`), allowing AI assistants (Claude Desktop, Cursor, Antigravity, Windsurf, Zed) and developers to create point-in-time disk checkpoints, test speculative/destructive code changes, and revert safely without host or guest cache corruption.
 
 ---
 
@@ -39,6 +39,8 @@ Add `vmpod` to your client configuration file (`claude_desktop_config.json` or M
 | **`vmpod_run`** | `name`, `command`, `workdir`, `env`, `timeout` | Executes a non-interactive shell command and returns `{ exit_code, stdout, stderr, duration_ms }`. |
 | **`vmpod_write_file`** | `name`, `path`, `content` | Writes a file or script directly into the guest VM filesystem. |
 | **`vmpod_read_file`** | `name`, `path` | Reads files, logs, or build artifacts from inside the VM back to the model. |
+| **`vmpod_snapshot`** | `name`, `action`, `tag` | Manages virtual disk snapshots (`action`: `create`, `list`, `delete`). |
+| **`vmpod_rollback`** | `name`, `tag` | Reverts the virtual disk to a snapshot point and cleanly reboots VM. |
 | **`vmpod_status`** | `name` | Inspects uptime, memory, vCPUs, and SSH port mappings. |
 | **`vmpod_list`** | *(none)* | Lists all active and stopped sandbox VMs. |
 | **`vmpod_down`** | `name`, `purge` | Terminates VM and automatically purges disk overlays if ephemeral. |
@@ -135,6 +137,37 @@ vmpod down agent-sandbox --json
 
 ---
 
+## Instant Snapshot & Rollback (`snapshot` | `rollback`)
+
+`vmpod` leverages QEMU QCOW2 internal snapshot headers to take instant, point-in-time virtual disk checkpoints and revert state on demand.
+
+### Preventing Kernel Split-Brain Cache Invalidation
+Reverting a virtual disk out from underneath an actively running Linux guest kernel corrupts in-memory dentry, inode, and dirty page caches. `vmpod` automatically prevents split-brain state:
+1. Flushes filesystem buffers via guest `sync`.
+2. Stops the QEMU container with a 5s graceful shutdown timeout.
+3. Applies `qemu-img snapshot -a <TAG> disk.qcow2`.
+4. Restarts the container with the original port/hardware bindings and verifies SSH readiness.
+
+### CLI Usage:
+
+```bash
+# Create a snapshot checkpoint
+vmpod snapshot create agent-sandbox clean-base [--json]
+
+# List all snapshots for a VM (non-disruptive, works on running or stopped VMs)
+vmpod snapshot list agent-sandbox [--json]
+
+# Revert back to the snapshot
+vmpod rollback agent-sandbox clean-base [--json]
+# Or using the snapshot subcommand:
+vmpod snapshot rollback agent-sandbox clean-base [--json]
+
+# Delete an obsolete snapshot
+vmpod snapshot delete agent-sandbox clean-base [--json]
+```
+
+---
+
 ## Safety Guardrails
 
 To protect host machines and workstations when autonomous agents generate infrastructure requests:
@@ -154,9 +187,9 @@ To protect host machines and workstations when autonomous agents generate infras
 Running `vmpod` with no arguments or typing `vmpod dashboard` (aliases: `vmpod tui`, `vmpod ui`) launches an interactive full-terminal management dashboard powered by **Ratatui**:
 
 ```text
-╭ ⚡  VMPOD - Hardware-Accelerated Linux VM Orchestrator ───────────────────────╮
-│    [↑/↓] Move [Enter] SSH [Space] Power [N] New [D] Del [R] Sync [Q] Quit    │
-╰──────────────────────────────────────────────────────────────────────────────╯
+╭ ⚡  VMPOD - Hardware-Accelerated Linux VM Orchestrator ──────────────────────────────╮
+│    [↑/↓] Move [Enter] SSH [Space] Power [C] Snap [N] New [D] Del [R] Sync [Q] Quit  │
+╰─────────────────────────────────────────────────────────────────────────────────────╯
 ╭ Virtual Machines (2) ────────╮╭ VM Instance Details ─────────────────────────╮
 │▶  ● cluster-1      [:2222]   ││ cluster-1  ● RUNNING    Uptime: 14m 20s      │
 │   ○ cluster-2      [off]     ││                                              │
@@ -179,6 +212,7 @@ Running `vmpod` with no arguments or typing `vmpod dashboard` (aliases: `vmpod t
 - **`↑ / ↓` or `k / j`**: Navigate through all active and stopped virtual machines.
 - **`Enter`**: Instantly launches an interactive SSH session attached directly to your terminal. Typing `exit` returns seamlessly to the dashboard.
 - **`Space` or `s`**: Toggle VM power (starts stopped instances, or gracefully flushes disk caches and powers down running instances).
+- **`C`**: Takes an instant point-in-time snapshot checkpoint of the selected VM.
 - **`N`**: Opens an interactive modal form to spin up a new VM (`Name`, `RAM`, `vCPUs`).
 - **`D` or `Delete`**: Prompts for confirmation to delete a VM and purge its virtual disk.
 - **`R`**: Forces an immediate refresh of Docker states, persistent disks, and logs.

@@ -98,6 +98,19 @@ pub fn validate_timeout(timeout_secs: u64) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_snapshot_tag(tag: &str) -> Result<()> {
+    let valid = !tag.is_empty()
+        && tag.len() <= 64
+        && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+    if !valid {
+        bail!(
+            "Invalid snapshot tag '{}': must be 1-64 characters and contain only [a-zA-Z0-9_.-].",
+            tag
+        );
+    }
+    Ok(())
+}
+
 /// Parameters for spinning up a new VM container instance
 #[derive(Debug, Clone)]
 pub struct UpParams {
@@ -152,6 +165,24 @@ pub struct DownResult {
     pub status: String,
     pub name: String,
     pub purged: bool,
+}
+
+/// Detailed information about a virtual disk snapshot
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    pub id: String,
+    pub tag: String,
+    pub date: String,
+    pub vm_size: String,
+}
+
+/// Result returned after a snapshot action (create, rollback, delete)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotResult {
+    pub instance: String,
+    pub action: String,
+    pub snapshot: String,
+    pub success: bool,
 }
 
 /// Result returned after inspecting a VM container
@@ -1017,6 +1048,295 @@ impl VmOrchestrator {
         Ok(removed)
     }
 
+    /// Execute a qemu-img operation inside a temporary runner container using Bollard directly
+    async fn run_qemu_img(&self, storage_path: &Path, args: &[&str]) -> Result<String> {
+        let rand_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            % 1000000;
+        let helper_name = format!("vmpod-qemu-img-{}", rand_id);
+        let canonical_storage = std::fs::canonicalize(storage_path)
+            .context("Failed to canonicalize storage path for qemu-img")?;
+
+        let container_body = ContainerCreateBody {
+            image: Some("vmpod/qemu-runner:latest".to_string()),
+            entrypoint: Some(vec!["qemu-img".to_string()]),
+            cmd: Some(args.iter().map(|s| s.to_string()).collect()),
+            host_config: Some(HostConfig {
+                binds: Some(vec![format!("{}:/storage:rw", canonical_storage.display())]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        self.docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: Some(helper_name.clone()),
+                    platform: String::new(),
+                }),
+                container_body,
+            )
+            .await
+            .context("Failed to create qemu-img helper container")?;
+
+        let start_res = self
+            .docker
+            .start_container(&helper_name, None::<StartContainerOptions>)
+            .await;
+
+        if let Err(e) = start_res {
+            let _ = self
+                .docker
+                .remove_container(
+                    &helper_name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(e).context("Failed to start qemu-img helper container");
+        }
+
+        use futures_util::StreamExt;
+        let mut wait_stream = self.docker.wait_container(
+            &helper_name,
+            None::<bollard::query_parameters::WaitContainerOptions>,
+        );
+        let wait_res = wait_stream.next().await;
+
+        let mut logs_stream = self.docker.logs(
+            &helper_name,
+            Some(bollard::query_parameters::LogsOptions {
+                stdout: true,
+                stderr: true,
+                ..Default::default()
+            }),
+        );
+
+        let mut output = String::new();
+        while let Some(Ok(log_output)) = logs_stream.next().await {
+            output.push_str(&log_output.to_string());
+        }
+
+        let _ = self
+            .docker
+            .remove_container(
+                &helper_name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        if let Some(Ok(exit)) = wait_res {
+            if exit.status_code != 0 {
+                bail!(
+                    "qemu-img command failed (exit code {}): {}",
+                    exit.status_code,
+                    output.trim()
+                );
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Create an instant point-in-time snapshot of the VM's virtual disk
+    pub async fn snapshot_create(&self, name: &str, tag: &str) -> Result<SnapshotResult> {
+        validate_snapshot_tag(tag)?;
+
+        let instances = self.list_instances().await?;
+        let inst = instances
+            .iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+
+        let storage_path = PathBuf::from(&inst.storage_path);
+        let was_running = inst.running;
+
+        if was_running {
+            // Flush disk buffers inside guest
+            let _ = self
+                .run_command(name, "sync", None, &[], std::time::Duration::from_secs(5))
+                .await;
+
+            // Stop container so QEMU releases exclusive write lock
+            self.docker
+                .stop_container(
+                    name,
+                    Some(StopContainerOptions {
+                        signal: None,
+                        t: Some(5),
+                    }),
+                )
+                .await
+                .context("Failed to stop container for snapshot creation")?;
+        }
+
+        // Run qemu-img snapshot -c <tag> /storage/disk.qcow2
+        let qemu_res = self
+            .run_qemu_img(&storage_path, &["snapshot", "-c", tag, "/storage/disk.qcow2"])
+            .await;
+
+        if was_running {
+            // Restart container
+            let _ = self
+                .docker
+                .start_container(name, None::<StartContainerOptions>)
+                .await;
+
+            // Wait for SSH readiness
+            if let Some(port) = inst.port {
+                let key_path = storage_path.join("id_ed25519");
+                let _ = self
+                    .wait_for_ssh_ready(port, &key_path, std::time::Duration::from_secs(45))
+                    .await;
+            }
+        }
+
+        qemu_res?;
+
+        Ok(SnapshotResult {
+            instance: name.to_string(),
+            action: "created".to_string(),
+            snapshot: tag.to_string(),
+            success: true,
+        })
+    }
+
+    /// List all snapshots available on the VM's virtual disk
+    pub async fn snapshot_list(&self, name: &str) -> Result<Vec<SnapshotInfo>> {
+        let instances = self.list_instances().await?;
+        let inst = instances
+            .iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+
+        let storage_path = PathBuf::from(&inst.storage_path);
+        // Use -U (--force-share) to query snapshot list without requiring VM stoppage
+        let output = self
+            .run_qemu_img(&storage_path, &["snapshot", "-U", "-l", "/storage/disk.qcow2"])
+            .await?;
+
+        Ok(parse_snapshot_list(&output))
+    }
+
+    /// Revert a VM back to a named snapshot
+    pub async fn snapshot_rollback(&self, name: &str, tag: &str) -> Result<SnapshotResult> {
+        validate_snapshot_tag(tag)?;
+
+        let instances = self.list_instances().await?;
+        let inst = instances
+            .iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+
+        let storage_path = PathBuf::from(&inst.storage_path);
+        let was_running = inst.running;
+
+        if was_running {
+            // Stop container so QEMU releases exclusive write lock
+            self.docker
+                .stop_container(
+                    name,
+                    Some(StopContainerOptions {
+                        signal: None,
+                        t: Some(5),
+                    }),
+                )
+                .await
+                .context("Failed to stop container for snapshot rollback")?;
+        }
+
+        // Apply rollback: qemu-img snapshot -a <tag> /storage/disk.qcow2
+        let qemu_res = self
+            .run_qemu_img(&storage_path, &["snapshot", "-a", tag, "/storage/disk.qcow2"])
+            .await;
+
+        if was_running {
+            // Restart container
+            let _ = self
+                .docker
+                .start_container(name, None::<StartContainerOptions>)
+                .await;
+
+            // Wait for SSH readiness
+            if let Some(port) = inst.port {
+                let key_path = storage_path.join("id_ed25519");
+                let _ = self
+                    .wait_for_ssh_ready(port, &key_path, std::time::Duration::from_secs(45))
+                    .await;
+            }
+        }
+
+        qemu_res?;
+
+        Ok(SnapshotResult {
+            instance: name.to_string(),
+            action: "reverted".to_string(),
+            snapshot: tag.to_string(),
+            success: true,
+        })
+    }
+
+    /// Delete a named snapshot from the VM's virtual disk
+    pub async fn snapshot_delete(&self, name: &str, tag: &str) -> Result<SnapshotResult> {
+        validate_snapshot_tag(tag)?;
+
+        let instances = self.list_instances().await?;
+        let inst = instances
+            .iter()
+            .find(|i| i.name == name)
+            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+
+        let storage_path = PathBuf::from(&inst.storage_path);
+        let was_running = inst.running;
+
+        if was_running {
+            self.docker
+                .stop_container(
+                    name,
+                    Some(StopContainerOptions {
+                        signal: None,
+                        t: Some(5),
+                    }),
+                )
+                .await
+                .context("Failed to stop container for snapshot deletion")?;
+        }
+
+        let qemu_res = self
+            .run_qemu_img(&storage_path, &["snapshot", "-d", tag, "/storage/disk.qcow2"])
+            .await;
+
+        if was_running {
+            let _ = self
+                .docker
+                .start_container(name, None::<StartContainerOptions>)
+                .await;
+
+            if let Some(port) = inst.port {
+                let key_path = storage_path.join("id_ed25519");
+                let _ = self
+                    .wait_for_ssh_ready(port, &key_path, std::time::Duration::from_secs(45))
+                    .await;
+            }
+        }
+
+        qemu_res?;
+
+        Ok(SnapshotResult {
+            instance: name.to_string(),
+            action: "deleted".to_string(),
+            snapshot: tag.to_string(),
+            success: true,
+        })
+    }
+
     /// List all managed vmpod instances on the host
     pub async fn list_instances(&self) -> Result<Vec<InstanceSummary>> {
         let mut filters = HashMap::new();
@@ -1349,9 +1669,93 @@ fn calculate_uptime(iso8601: &str) -> String {
     "running".to_string()
 }
 
+/// Parse output of `qemu-img snapshot -l` into a list of SnapshotInfo
+pub fn parse_snapshot_list(output: &str) -> Vec<SnapshotInfo> {
+    let mut snapshots = Vec::new();
+    let mut past_header = false;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.starts_with("ID") && line.contains("TAG") {
+            past_header = true;
+            continue;
+        }
+        if !past_header || line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // Format: ID TAG VM_SIZE DATE TIME VM_CLOCK ICOUNT...
+        if parts.len() >= 6 {
+            let id = parts[0].to_string();
+            let tag = parts[1].to_string();
+            let vm_size = format!("{} {}", parts[2], parts[3]);
+            let date = format!("{} {}", parts[4], parts[5]);
+
+            snapshots.push(SnapshotInfo {
+                id,
+                tag,
+                date,
+                vm_size,
+            });
+        }
+    }
+
+    snapshots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_snapshot_tag() {
+        assert!(validate_snapshot_tag("clean-base").is_ok());
+        assert!(validate_snapshot_tag("v1.0").is_ok());
+        assert!(validate_snapshot_tag("snap_01").is_ok());
+        assert!(validate_snapshot_tag("").is_err());
+        assert!(validate_snapshot_tag("tag with spaces").is_err());
+        assert!(validate_snapshot_tag("bad/slash").is_err());
+        assert!(validate_snapshot_tag(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn test_parse_snapshot_list() {
+        let output = r#"
+Snapshot list:
+ID      TAG               VM_SIZE                DATE        VM_CLOCK     ICOUNT
+1       snap1                 0 B 2026-11-02 02:42:57  0000:00:00.000          0
+2       clean-state          15 MiB 2026-11-02 03:00:10  0000:00:00.000          0
+"#;
+        let list = parse_snapshot_list(output);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "1");
+        assert_eq!(list[0].tag, "snap1");
+        assert_eq!(list[0].vm_size, "0 B");
+        assert_eq!(list[0].date, "2026-11-02 02:42:57");
+
+        assert_eq!(list[1].id, "2");
+        assert_eq!(list[1].tag, "clean-state");
+        assert_eq!(list[1].vm_size, "15 MiB");
+        assert_eq!(list[1].date, "2026-11-02 03:00:10");
+    }
+
+    #[test]
+    fn test_serde_snapshot_result() {
+        let res = SnapshotResult {
+            instance: "agent-1".into(),
+            action: "created".into(),
+            snapshot: "clean-base".into(),
+            success: true,
+        };
+        let json_str = serde_json::to_string(&res).expect("serialization failed");
+        assert!(json_str.contains("\"action\":\"created\""));
+        assert!(json_str.contains("\"snapshot\":\"clean-base\""));
+
+        let de: SnapshotResult = serde_json::from_str(&json_str).expect("deserialization failed");
+        assert_eq!(de.snapshot, "clean-base");
+        assert!(de.success);
+    }
 
     #[test]
     fn test_validate_name() {

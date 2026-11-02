@@ -146,6 +146,47 @@ fn get_tools_list() -> Value {
                 }
             },
             {
+                "name": "vmpod_snapshot",
+                "description": "Manage virtual disk snapshots (checkpoints) for a VM. Actions: 'create', 'list', 'delete'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Target VM instance name."
+                        },
+                        "action": {
+                            "type": "string",
+                            "description": "Snapshot action to perform: 'create', 'list', or 'delete'.",
+                            "enum": ["create", "list", "delete"]
+                        },
+                        "tag": {
+                            "type": "string",
+                            "description": "Snapshot name/tag (required for 'create' and 'delete')."
+                        }
+                    },
+                    "required": ["name", "action"]
+                }
+            },
+            {
+                "name": "vmpod_rollback",
+                "description": "Instantly revert a VM's virtual disk back to a named snapshot checkpoint.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Target VM instance name."
+                        },
+                        "tag": {
+                            "type": "string",
+                            "description": "Name or tag of the snapshot checkpoint to revert to."
+                        }
+                    },
+                    "required": ["name", "tag"]
+                }
+            },
+            {
                 "name": "vmpod_status",
                 "description": "Inspect the status, IP/port mappings, uptime, and resource usage of a VM instance.",
                 "inputSchema": {
@@ -455,6 +496,78 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                 .map_err(|e| e.to_string())
         }
 
+        "vmpod_snapshot" => {
+            let instance_name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'name'".to_string())?;
+
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list");
+
+            match action {
+                "create" => {
+                    let tag = args
+                        .get("tag")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "Missing required parameter 'tag' for snapshot create".to_string())?;
+
+                    let res = orchestrator
+                        .snapshot_create(instance_name, tag)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+                }
+                "list" => {
+                    let res = orchestrator
+                        .snapshot_list(instance_name)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+                }
+                "delete" => {
+                    let tag = args
+                        .get("tag")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "Missing required parameter 'tag' for snapshot delete".to_string())?;
+
+                    let res = orchestrator
+                        .snapshot_delete(instance_name, tag)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+                }
+                _ => Err(format!(
+                    "Invalid action '{}': must be 'create', 'list', or 'delete'",
+                    action
+                )),
+            }
+        }
+
+        "vmpod_rollback" => {
+            let instance_name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'name'".to_string())?;
+
+            let tag = args
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Missing required parameter 'tag'".to_string())?;
+
+            let res = orchestrator
+                .snapshot_rollback(instance_name, tag)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+        }
+
         "vmpod_status" => {
             let instance_name = args
                 .get("name")
@@ -575,13 +688,15 @@ mod tests {
 
         let res = resp.result.expect("Missing result");
         let tools = res["tools"].as_array().expect("Tools is not an array");
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 9);
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"vmpod_spin"));
         assert!(tool_names.contains(&"vmpod_run"));
         assert!(tool_names.contains(&"vmpod_write_file"));
         assert!(tool_names.contains(&"vmpod_read_file"));
+        assert!(tool_names.contains(&"vmpod_snapshot"));
+        assert!(tool_names.contains(&"vmpod_rollback"));
         assert!(tool_names.contains(&"vmpod_status"));
         assert!(tool_names.contains(&"vmpod_list"));
         assert!(tool_names.contains(&"vmpod_down"));
