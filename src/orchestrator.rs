@@ -629,30 +629,43 @@ impl VmOrchestrator {
         timeout: std::time::Duration,
     ) -> Result<std::time::Duration> {
         let start = std::time::Instant::now();
-        let interval = std::time::Duration::from_millis(500);
+        let interval = std::time::Duration::from_millis(200);
 
         while start.elapsed() < timeout {
             if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                // Fast-probe: Check if guest SSH server has sent the protocol banner ("SSH-2.0...")
+                // Prevents dozens of wasted heavy process fork/execs while guest kernel is still booting.
+                let mut buf = [0u8; 8];
+                let banner_read = tokio::time::timeout(
+                    std::time::Duration::from_millis(150),
+                    tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+                )
+                .await;
+
                 let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
 
-                let output = tokio::process::Command::new("ssh")
-                    .arg("-n")
-                    .arg("-i").arg(key_path)
-                    .arg("-o").arg("BatchMode=yes")
-                    .arg("-o").arg("StrictHostKeyChecking=no")
-                    .arg("-o").arg("UserKnownHostsFile=/dev/null")
-                    .arg("-o").arg("LogLevel=ERROR")
-                    .arg("-o").arg("ConnectTimeout=2")
-                    .arg("-p").arg(port.to_string())
-                    .arg("root@127.0.0.1")
-                    .arg("true")
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                    .await;
+                if let Ok(Ok(n)) = banner_read {
+                    if n >= 4 && &buf[..4] == b"SSH-" {
+                        let output = tokio::process::Command::new("ssh")
+                            .arg("-n")
+                            .arg("-i").arg(key_path)
+                            .arg("-o").arg("BatchMode=yes")
+                            .arg("-o").arg("StrictHostKeyChecking=no")
+                            .arg("-o").arg("UserKnownHostsFile=/dev/null")
+                            .arg("-o").arg("LogLevel=ERROR")
+                            .arg("-o").arg("ConnectTimeout=2")
+                            .arg("-p").arg(port.to_string())
+                            .arg("root@127.0.0.1")
+                            .arg("true")
+                            .stdin(std::process::Stdio::null())
+                            .output()
+                            .await;
 
-                if let Ok(out) = output {
-                    if out.status.success() {
-                        return Ok(start.elapsed());
+                        if let Ok(out) = output {
+                            if out.status.success() {
+                                return Ok(start.elapsed());
+                            }
+                        }
                     }
                 }
             }
@@ -713,11 +726,7 @@ impl VmOrchestrator {
     ) -> Result<RunResult> {
         validate_timeout(timeout.as_secs())?;
 
-        let instances = self.list_instances().await?;
-        let inst = instances
-            .iter()
-            .find(|i| i.name == name)
-            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+        let inst = self.get_instance(name).await?;
 
         if !inst.running {
             bail!(
@@ -746,6 +755,7 @@ impl VmOrchestrator {
         script.push_str(command);
 
         let start = std::time::Instant::now();
+        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
 
         let mut child = tokio::process::Command::new("ssh")
             .arg("-n")
@@ -755,6 +765,9 @@ impl VmOrchestrator {
             .arg("-o").arg("UserKnownHostsFile=/dev/null")
             .arg("-o").arg("LogLevel=ERROR")
             .arg("-o").arg("ConnectTimeout=5")
+            .arg("-o").arg("ControlMaster=auto")
+            .arg("-o").arg(format!("ControlPath={}", mux_socket))
+            .arg("-o").arg("ControlPersist=30s")
             .arg("-p").arg(port.to_string())
             .arg("root@127.0.0.1")
             .arg(&script)
@@ -817,11 +830,7 @@ impl VmOrchestrator {
 
     /// Write file contents directly to a path inside the VM via SSH stdin.
     pub async fn write_file(&self, name: &str, path: &str, content: &[u8]) -> Result<()> {
-        let instances = self.list_instances().await?;
-        let inst = instances
-            .iter()
-            .find(|i| i.name == name)
-            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+        let inst = self.get_instance(name).await?;
 
         if !inst.running {
             bail!("VM instance '{}' is not currently running.", name);
@@ -834,6 +843,7 @@ impl VmOrchestrator {
 
         let escaped_path = path.replace('\'', "'\\''");
         let shell_cmd = format!("mkdir -p \"$(dirname '{}')\" && cat > '{}'", escaped_path, escaped_path);
+        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
 
         let mut child = tokio::process::Command::new("ssh")
             .arg("-i").arg(&key_path)
@@ -842,6 +852,9 @@ impl VmOrchestrator {
             .arg("-o").arg("UserKnownHostsFile=/dev/null")
             .arg("-o").arg("LogLevel=ERROR")
             .arg("-o").arg("ConnectTimeout=5")
+            .arg("-o").arg("ControlMaster=auto")
+            .arg("-o").arg(format!("ControlPath={}", mux_socket))
+            .arg("-o").arg("ControlPersist=30s")
             .arg("-p").arg(port.to_string())
             .arg("root@127.0.0.1")
             .arg(&shell_cmd)
@@ -876,11 +889,7 @@ impl VmOrchestrator {
 
     /// Read file contents from inside the VM via SSH.
     pub async fn read_file(&self, name: &str, path: &str) -> Result<String> {
-        let instances = self.list_instances().await?;
-        let inst = instances
-            .iter()
-            .find(|i| i.name == name)
-            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
+        let inst = self.get_instance(name).await?;
 
         if !inst.running {
             bail!("VM instance '{}' is not currently running.", name);
@@ -893,6 +902,7 @@ impl VmOrchestrator {
 
         let escaped_path = path.replace('\'', "'\\''");
         let shell_cmd = format!("cat '{}'", escaped_path);
+        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
 
         let output = tokio::process::Command::new("ssh")
             .arg("-n")
@@ -902,6 +912,9 @@ impl VmOrchestrator {
             .arg("-o").arg("UserKnownHostsFile=/dev/null")
             .arg("-o").arg("LogLevel=ERROR")
             .arg("-o").arg("ConnectTimeout=5")
+            .arg("-o").arg("ControlMaster=auto")
+            .arg("-o").arg(format!("ControlPath={}", mux_socket))
+            .arg("-o").arg("ControlPersist=30s")
             .arg("-p").arg(port.to_string())
             .arg("root@127.0.0.1")
             .arg(&shell_cmd)
@@ -921,6 +934,9 @@ impl VmOrchestrator {
     /// Gracefully stop the VM container and remove it.
     /// If `purge` is true or if the container is labeled ephemeral, deletes host storage.
     pub async fn down(&self, name: &str, purge: bool) -> Result<DownResult> {
+        // Clean up SSH multiplexing control socket
+        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let _ = std::fs::remove_file(&mux_socket);
         let inspect = match self
             .docker
             .inspect_container(name, None::<InspectContainerOptions>)
@@ -1145,18 +1161,66 @@ impl VmOrchestrator {
         Ok(output)
     }
 
+    /// Execute qemu-img directly inside an actively running container via docker exec (~10ms)
+    async fn exec_qemu_img(&self, name: &str, args: &[&str]) -> Result<String> {
+        use bollard::exec::{CreateExecOptions, StartExecResults};
+        use futures_util::StreamExt;
+
+        let mut cmd = vec!["qemu-img"];
+        cmd.extend_from_slice(args);
+
+        let exec = self
+            .docker
+            .create_exec(
+                name,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(cmd.iter().map(|s| s.to_string()).collect()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("Failed to create exec in container")?;
+
+        let results = self
+            .docker
+            .start_exec(&exec.id, None)
+            .await
+            .context("Failed to start exec in container")?;
+
+        let mut output = String::new();
+        if let StartExecResults::Attached { output: mut stream, .. } = results {
+            while let Some(Ok(chunk)) = stream.next().await {
+                output.push_str(&chunk.to_string());
+            }
+        }
+
+        let inspect = self
+            .docker
+            .inspect_exec(&exec.id)
+            .await
+            .context("Failed to inspect exec process")?;
+
+        let exit_code = inspect.exit_code.unwrap_or(0);
+        if exit_code != 0 {
+            bail!("qemu-img exec failed (exit code {}): {}", exit_code, output.trim());
+        }
+
+        Ok(output)
+    }
+
     /// Create an instant point-in-time snapshot of the VM's virtual disk
     pub async fn snapshot_create(&self, name: &str, tag: &str) -> Result<SnapshotResult> {
         validate_snapshot_tag(tag)?;
 
-        let instances = self.list_instances().await?;
-        let inst = instances
-            .iter()
-            .find(|i| i.name == name)
-            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
-
+        let inst = self.get_instance(name).await?;
         let storage_path = PathBuf::from(&inst.storage_path);
         let was_running = inst.running;
+
+        // Clean up multiplexing socket if container will be restarted
+        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let _ = std::fs::remove_file(&mux_socket);
 
         if was_running {
             // Flush disk buffers inside guest
@@ -1210,17 +1274,21 @@ impl VmOrchestrator {
 
     /// List all snapshots available on the VM's virtual disk
     pub async fn snapshot_list(&self, name: &str) -> Result<Vec<SnapshotInfo>> {
-        let instances = self.list_instances().await?;
-        let inst = instances
-            .iter()
-            .find(|i| i.name == name)
-            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
-
+        let inst = self.get_instance(name).await?;
         let storage_path = PathBuf::from(&inst.storage_path);
-        // Use -U (--force-share) to query snapshot list without requiring VM stoppage
-        let output = self
-            .run_qemu_img(&storage_path, &["snapshot", "-U", "-l", "/storage/disk.qcow2"])
-            .await?;
+
+        // Fast path: if container is currently running, execute directly inside it (~10ms)
+        // rather than spinning up a new helper container (~500ms).
+        let output = if inst.running {
+            match self.exec_qemu_img(name, &["snapshot", "-U", "-l", "/storage/disk.qcow2"]).await {
+                Ok(out) => out,
+                Err(_) => {
+                    self.run_qemu_img(&storage_path, &["snapshot", "-U", "-l", "/storage/disk.qcow2"]).await?
+                }
+            }
+        } else {
+            self.run_qemu_img(&storage_path, &["snapshot", "-U", "-l", "/storage/disk.qcow2"]).await?
+        };
 
         Ok(parse_snapshot_list(&output))
     }
@@ -1229,14 +1297,12 @@ impl VmOrchestrator {
     pub async fn snapshot_rollback(&self, name: &str, tag: &str) -> Result<SnapshotResult> {
         validate_snapshot_tag(tag)?;
 
-        let instances = self.list_instances().await?;
-        let inst = instances
-            .iter()
-            .find(|i| i.name == name)
-            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
-
+        let inst = self.get_instance(name).await?;
         let storage_path = PathBuf::from(&inst.storage_path);
         let was_running = inst.running;
+
+        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let _ = std::fs::remove_file(&mux_socket);
 
         if was_running {
             // Stop container so QEMU releases exclusive write lock
@@ -1287,14 +1353,12 @@ impl VmOrchestrator {
     pub async fn snapshot_delete(&self, name: &str, tag: &str) -> Result<SnapshotResult> {
         validate_snapshot_tag(tag)?;
 
-        let instances = self.list_instances().await?;
-        let inst = instances
-            .iter()
-            .find(|i| i.name == name)
-            .ok_or_else(|| anyhow::anyhow!("VM instance '{}' not found.", name))?;
-
+        let inst = self.get_instance(name).await?;
         let storage_path = PathBuf::from(&inst.storage_path);
         let was_running = inst.running;
+
+        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let _ = std::fs::remove_file(&mux_socket);
 
         if was_running {
             self.docker
@@ -1337,19 +1401,179 @@ impl VmOrchestrator {
         })
     }
 
+    /// Efficiently retrieve an instance by name without listing all Docker containers
+    pub async fn get_instance(&self, name: &str) -> Result<InstanceSummary> {
+        match self
+            .docker
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(inspect) => {
+                let container_id = inspect.id.unwrap_or_default();
+                let short_id = if container_id.len() >= 12 {
+                    container_id[..12].to_string()
+                } else {
+                    container_id.clone()
+                };
+
+                let state = inspect.state.unwrap_or_default();
+                let running = state.running.unwrap_or(false);
+                let status = state.status.map(|s| s.to_string()).unwrap_or_else(|| {
+                    if running {
+                        "running".to_string()
+                    } else {
+                        "stopped".to_string()
+                    }
+                });
+
+                let config = inspect.config.unwrap_or_default();
+                let labels = config.labels.unwrap_or_default();
+
+                let mut port = None;
+                if let Some(network_settings) = inspect.network_settings {
+                    if let Some(ports) = network_settings.ports {
+                        for (container_port, host_bindings) in ports {
+                            if container_port.starts_with("22") {
+                                if let Some(bindings) = host_bindings {
+                                    for b in bindings {
+                                        if let Some(hp) = b.host_port {
+                                            if let Ok(p) = hp.parse::<u16>() {
+                                                port = Some(p);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if port.is_none() {
+                    if let Some(p_str) = labels.get(LABEL_SSH_PORT) {
+                        port = p_str.parse::<u16>().ok();
+                    }
+                }
+
+                let ssh_command = match port {
+                    Some(p) => format!("ssh root@localhost -p {p}"),
+                    None => "None".to_string(),
+                };
+
+                let ram = labels
+                    .get(LABEL_RAM)
+                    .cloned()
+                    .unwrap_or_else(|| "2G".to_string());
+                let smp = labels
+                    .get(LABEL_SMP)
+                    .cloned()
+                    .unwrap_or_else(|| "2".to_string());
+
+                let mut storage_path = format!("./vmpod-data/{}", name);
+                if let Some(mounts) = inspect.mounts {
+                    for m in mounts {
+                        if m.destination == Some("/storage".to_string()) {
+                            if let Some(src) = m.source {
+                                storage_path = src;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let started_at_raw = state.started_at.unwrap_or_default();
+                let uptime = if running && !started_at_raw.is_empty() {
+                    calculate_uptime(&started_at_raw)
+                } else if running {
+                    "running".to_string()
+                } else {
+                    "stopped".to_string()
+                };
+
+                let ephemeral = labels
+                    .get(LABEL_EPHEMERAL)
+                    .map(|v| v == "true")
+                    .unwrap_or(false);
+
+                Ok(InstanceSummary {
+                    name: name.to_string(),
+                    container_id,
+                    short_id,
+                    status,
+                    running,
+                    port,
+                    ssh_command,
+                    uptime,
+                    ram,
+                    smp,
+                    storage_path,
+                    ephemeral,
+                })
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // Check offline instance directory
+                let candidate_path = PathBuf::from(format!("./vmpod-data/{}", name));
+                let disk_path = candidate_path.join("disk.qcow2");
+                if disk_path.exists() {
+                    let canonical = candidate_path.canonicalize().unwrap_or(candidate_path);
+                    Ok(InstanceSummary {
+                        name: name.to_string(),
+                        container_id: "offline".to_string(),
+                        short_id: "offline".to_string(),
+                        status: "stopped".to_string(),
+                        running: false,
+                        port: None,
+                        ssh_command: format!("vmpod up {}", name),
+                        uptime: "offline".to_string(),
+                        ram: "-".to_string(),
+                        smp: "-".to_string(),
+                        storage_path: canonical.to_string_lossy().to_string(),
+                        ephemeral: false,
+                    })
+                } else {
+                    bail!("VM instance '{}' not found.", name);
+                }
+            }
+            Err(e) => Err(e).context(format!("Failed to retrieve instance info for '{}'", name)),
+        }
+    }
+
     /// List all managed vmpod instances on the host
     pub async fn list_instances(&self) -> Result<Vec<InstanceSummary>> {
         let mut filters = HashMap::new();
         filters.insert("label".to_string(), vec![format!("{}=true", LABEL_MANAGED)]);
 
-        // Query labeled containers (or scan image matching vmpod/qemu-runner)
-        let containers = self
+        // Query labeled containers with server-side label filtering
+        let mut containers = self
             .docker
             .list_containers(Some(
-                ListContainersOptionsBuilder::default().all(true).build(),
+                ListContainersOptionsBuilder::default()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
             ))
             .await
             .context("Failed to list Docker containers")?;
+
+        // Fallback for legacy vmpod-box container if no labeled containers found
+        if containers.is_empty() {
+            if let Ok(legacy) = self
+                .docker
+                .inspect_container("vmpod-box", None::<InspectContainerOptions>)
+                .await
+            {
+                if let Some(id) = legacy.id {
+                    let mut legacy_summary = bollard::models::ContainerSummary::default();
+                    legacy_summary.id = Some(id);
+                    legacy_summary.names = Some(vec!["/vmpod-box".to_string()]);
+                    if let Some(st) = legacy.state {
+                        legacy_summary.state = st.status.and_then(|s| s.to_string().parse().ok());
+                    }
+                    containers.push(legacy_summary);
+                }
+            }
+        }
 
         let mut instances = Vec::new();
 

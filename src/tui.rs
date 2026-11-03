@@ -90,24 +90,11 @@ impl App {
         }
     }
 
-    /// Refresh list of instances and update details for current selection
-    pub async fn refresh(&mut self) -> Result<()> {
-        let instances = self.orchestrator.list_instances().await.unwrap_or_default();
-        self.instances = instances;
-
-        if self.instances.is_empty() {
-            self.selected_index = 0;
-            self.list_state.select(None);
-            self.selected_status = None;
-            self.logs = vec!["No active instances found. Press [N] to create a new VM.".to_string()];
-        } else {
-            if self.selected_index >= self.instances.len() {
-                self.selected_index = self.instances.len() - 1;
-            }
-            self.list_state.select(Some(self.selected_index));
-
-            let selected_name = self.instances[self.selected_index].name.clone();
-            let is_running = self.instances[self.selected_index].running;
+    /// Update details and logs for the currently selected instance only (fast, no Docker list scan)
+    pub async fn update_selected_details(&mut self) {
+        if let Some(inst) = self.selected_instance() {
+            let selected_name = inst.name.clone();
+            let is_running = inst.running;
 
             if let Ok(st) = self.orchestrator.status(&selected_name).await {
                 self.selected_status = Some(st);
@@ -133,6 +120,25 @@ impl App {
                     "Press [Space] to start this virtual machine.".to_string(),
                 ];
             }
+        }
+    }
+
+    /// Refresh list of instances and update details for current selection
+    pub async fn refresh(&mut self) -> Result<()> {
+        let instances = self.orchestrator.list_instances().await.unwrap_or_default();
+        self.instances = instances;
+
+        if self.instances.is_empty() {
+            self.selected_index = 0;
+            self.list_state.select(None);
+            self.selected_status = None;
+            self.logs = vec!["No active instances found. Press [N] to create a new VM.".to_string()];
+        } else {
+            if self.selected_index >= self.instances.len() {
+                self.selected_index = self.instances.len() - 1;
+            }
+            self.list_state.select(Some(self.selected_index));
+            self.update_selected_details().await;
         }
 
         self.last_refresh = Instant::now();
@@ -465,11 +471,11 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_up();
-                let _ = self.refresh().await;
+                self.update_selected_details().await;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_down();
-                let _ = self.refresh().await;
+                self.update_selected_details().await;
             }
             KeyCode::Enter => {
                 self.launch_ssh()?;
