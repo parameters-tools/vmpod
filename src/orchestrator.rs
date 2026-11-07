@@ -33,10 +33,14 @@ pub const MAX_GUARDRAIL_TIMEOUT_SECS: u64 = 1800;
 pub fn validate_name(name: &str) -> Result<()> {
     let valid = !name.is_empty()
         && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && !name.starts_with('-')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
     if !valid {
         bail!(
-            "Invalid instance name '{}': must be 1-64 characters and contain only [a-zA-Z0-9_.-].",
+            "Invalid instance name '{}': must be 1-64 characters [a-zA-Z0-9_.-], cannot start with '.' or '-', and cannot be '.' or '..'.",
             name
         );
     }
@@ -58,14 +62,19 @@ pub fn validate_smp(smp: u32) -> Result<()> {
 }
 
 pub fn validate_ram(ram: &str) -> Result<()> {
-    let ram_trim = ram.trim();
-    let (num_part, unit) = ram_trim.split_at(ram_trim.len().saturating_sub(1));
+    if ram.is_empty() || !ram.chars().all(|c| c.is_ascii_alphanumeric()) {
+        bail!(
+            "Invalid RAM allocation '{}': must contain only alphanumeric characters (e.g. '512M', '2G', '4G').",
+            ram
+        );
+    }
+    let (num_part, unit) = ram.split_at(ram.len().saturating_sub(1));
     let ram_val_gb = if unit.eq_ignore_ascii_case("g") {
         num_part.parse::<u64>().ok()
     } else if unit.eq_ignore_ascii_case("m") {
         num_part.parse::<u64>().ok().map(|m| (m + 1023) / 1024)
     } else {
-        ram_trim.parse::<u64>().ok()
+        ram.parse::<u64>().ok()
     };
 
     match ram_val_gb {
@@ -101,14 +110,46 @@ pub fn validate_timeout(timeout_secs: u64) -> Result<()> {
 pub fn validate_snapshot_tag(tag: &str) -> Result<()> {
     let valid = !tag.is_empty()
         && tag.len() <= 64
+        && tag != "."
+        && tag != ".."
+        && !tag.starts_with('.')
+        && !tag.starts_with('-')
         && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
     if !valid {
         bail!(
-            "Invalid snapshot tag '{}': must be 1-64 characters and contain only [a-zA-Z0-9_.-].",
+            "Invalid snapshot tag '{}': must be 1-64 characters [a-zA-Z0-9_.-], cannot start with '.' or '-', and cannot be '.' or '..'.",
             tag
         );
     }
     Ok(())
+}
+
+pub fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Retrieve a secure, user-private directory for SSH multiplexing sockets
+pub fn get_secure_mux_socket(name: &str) -> PathBuf {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let dir = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let p = PathBuf::from(runtime_dir).join("vmpod");
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&p);
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+        p
+    } else {
+        let uid = unsafe { getuid() };
+        let p = PathBuf::from(format!("/tmp/vmpod-{}", uid));
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&p);
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+        p
+    };
+    dir.join(format!("{}.sock", name))
 }
 
 /// Parameters for spinning up a new VM container instance
@@ -302,8 +343,8 @@ impl VmOrchestrator {
             if occupied_docker_ports.contains(&port) {
                 return false;
             }
-            // Verify TCP bind succeeds on 0.0.0.0 and 127.0.0.1
-            match TcpListener::bind(("0.0.0.0", port)) {
+            // Verify TCP bind succeeds on localhost loopback
+            match TcpListener::bind(("127.0.0.1", port)) {
                 Ok(_) => true,
                 Err(_) => false,
             }
@@ -351,7 +392,7 @@ impl VmOrchestrator {
             }
         };
 
-        // Ensure directory exists
+        // Ensure directory exists with strict user-only permissions (0700) to protect private keys & disk images
         if !storage_path.exists() {
             tokio::fs::create_dir_all(&storage_path)
                 .await
@@ -361,6 +402,13 @@ impl VmOrchestrator {
                         storage_path.display()
                     )
                 })?;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&storage_path, std::fs::Permissions::from_mode(0o700));
+        let vmpod_data = Path::new("./vmpod-data");
+        if vmpod_data.exists() {
+            let _ = std::fs::set_permissions(vmpod_data, std::fs::Permissions::from_mode(0o700));
         }
 
         let canonical_storage = std::fs::canonicalize(&storage_path).with_context(|| {
@@ -474,13 +522,13 @@ impl VmOrchestrator {
         // Direct host volume bind to bypass Docker overlay2 filesystem
         let bind_spec = format!("{}:/storage:rw", canonical_storage.display());
 
-        // Port mapping for guest SSH (port 22)
+        // Port mapping for guest SSH (port 22) - strictly bind 127.0.0.1 loopback for local security
         let guest_ssh_key = "22/tcp".to_string();
         let mut port_bindings: PortMap = HashMap::new();
         port_bindings.insert(
             guest_ssh_key.clone(),
             Some(vec![PortBinding {
-                host_ip: Some("0.0.0.0".to_string()),
+                host_ip: Some("127.0.0.1".to_string()),
                 host_port: Some(actual_port.to_string()),
             }]),
         );
@@ -746,16 +794,25 @@ impl VmOrchestrator {
         let mut script = String::new();
         for env in envs {
             if let Some((k, v)) = env.split_once('=') {
+                if !is_valid_env_key(k) {
+                    bail!(
+                        "Invalid environment variable name '{}': must match [a-zA-Z_][a-zA-Z0-9_]*",
+                        k
+                    );
+                }
                 script.push_str(&format!("export {}='{}' && ", k, v.replace('\'', "'\\''")));
+            } else {
+                bail!("Invalid environment variable format '{}': expected KEY=VALUE", env);
             }
         }
         if let Some(wd) = workdir {
-            script.push_str(&format!("mkdir -p '{}' && cd '{}' && ", wd, wd));
+            let escaped_wd = wd.replace('\'', "'\\''");
+            script.push_str(&format!("mkdir -p -- '{}' && cd -- '{}' && ", escaped_wd, escaped_wd));
         }
         script.push_str(command);
 
         let start = std::time::Instant::now();
-        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let mux_socket = get_secure_mux_socket(name);
 
         let mut child = tokio::process::Command::new("ssh")
             .arg("-n")
@@ -766,7 +823,7 @@ impl VmOrchestrator {
             .arg("-o").arg("LogLevel=ERROR")
             .arg("-o").arg("ConnectTimeout=5")
             .arg("-o").arg("ControlMaster=auto")
-            .arg("-o").arg(format!("ControlPath={}", mux_socket))
+            .arg("-o").arg(format!("ControlPath={}", mux_socket.display()))
             .arg("-o").arg("ControlPersist=30s")
             .arg("-p").arg(port.to_string())
             .arg("root@127.0.0.1")
@@ -842,8 +899,9 @@ impl VmOrchestrator {
         let key_path = PathBuf::from(&inst.storage_path).join("id_ed25519");
 
         let escaped_path = path.replace('\'', "'\\''");
-        let shell_cmd = format!("mkdir -p \"$(dirname '{}')\" && cat > '{}'", escaped_path, escaped_path);
-        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        // Safe variable assignment avoids nested command substitution injection inside $(dirname ...)
+        let shell_cmd = format!("p='{}'; d=$(dirname -- \"$p\"); mkdir -p -- \"$d\" && cat -- > \"$p\"", escaped_path);
+        let mux_socket = get_secure_mux_socket(name);
 
         let mut child = tokio::process::Command::new("ssh")
             .arg("-i").arg(&key_path)
@@ -853,7 +911,7 @@ impl VmOrchestrator {
             .arg("-o").arg("LogLevel=ERROR")
             .arg("-o").arg("ConnectTimeout=5")
             .arg("-o").arg("ControlMaster=auto")
-            .arg("-o").arg(format!("ControlPath={}", mux_socket))
+            .arg("-o").arg(format!("ControlPath={}", mux_socket.display()))
             .arg("-o").arg("ControlPersist=30s")
             .arg("-p").arg(port.to_string())
             .arg("root@127.0.0.1")
@@ -901,8 +959,8 @@ impl VmOrchestrator {
         let key_path = PathBuf::from(&inst.storage_path).join("id_ed25519");
 
         let escaped_path = path.replace('\'', "'\\''");
-        let shell_cmd = format!("cat '{}'", escaped_path);
-        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let shell_cmd = format!("cat -- '{}'", escaped_path);
+        let mux_socket = get_secure_mux_socket(name);
 
         let output = tokio::process::Command::new("ssh")
             .arg("-n")
@@ -913,7 +971,7 @@ impl VmOrchestrator {
             .arg("-o").arg("LogLevel=ERROR")
             .arg("-o").arg("ConnectTimeout=5")
             .arg("-o").arg("ControlMaster=auto")
-            .arg("-o").arg(format!("ControlPath={}", mux_socket))
+            .arg("-o").arg(format!("ControlPath={}", mux_socket.display()))
             .arg("-o").arg("ControlPersist=30s")
             .arg("-p").arg(port.to_string())
             .arg("root@127.0.0.1")
@@ -935,7 +993,7 @@ impl VmOrchestrator {
     /// If `purge` is true or if the container is labeled ephemeral, deletes host storage.
     pub async fn down(&self, name: &str, purge: bool) -> Result<DownResult> {
         // Clean up SSH multiplexing control socket
-        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let mux_socket = get_secure_mux_socket(name);
         let _ = std::fs::remove_file(&mux_socket);
         let inspect = match self
             .docker
@@ -1219,7 +1277,7 @@ impl VmOrchestrator {
         let was_running = inst.running;
 
         // Clean up multiplexing socket if container will be restarted
-        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let mux_socket = get_secure_mux_socket(name);
         let _ = std::fs::remove_file(&mux_socket);
 
         if was_running {
@@ -1301,7 +1359,7 @@ impl VmOrchestrator {
         let storage_path = PathBuf::from(&inst.storage_path);
         let was_running = inst.running;
 
-        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let mux_socket = get_secure_mux_socket(name);
         let _ = std::fs::remove_file(&mux_socket);
 
         if was_running {
@@ -1357,7 +1415,7 @@ impl VmOrchestrator {
         let storage_path = PathBuf::from(&inst.storage_path);
         let was_running = inst.running;
 
-        let mux_socket = format!("/tmp/vmpod-{}.sock", name);
+        let mux_socket = get_secure_mux_socket(name);
         let _ = std::fs::remove_file(&mux_socket);
 
         if was_running {
@@ -1938,6 +1996,10 @@ mod tests {
         assert!(validate_snapshot_tag("v1.0").is_ok());
         assert!(validate_snapshot_tag("snap_01").is_ok());
         assert!(validate_snapshot_tag("").is_err());
+        assert!(validate_snapshot_tag(".").is_err());
+        assert!(validate_snapshot_tag("..").is_err());
+        assert!(validate_snapshot_tag("-tag").is_err());
+        assert!(validate_snapshot_tag(".hidden").is_err());
         assert!(validate_snapshot_tag("tag with spaces").is_err());
         assert!(validate_snapshot_tag("bad/slash").is_err());
         assert!(validate_snapshot_tag(&"a".repeat(65)).is_err());
@@ -1987,6 +2049,10 @@ ID      TAG               VM_SIZE                DATE        VM_CLOCK     ICOUNT
         assert!(validate_name("test_vm.01").is_ok());
         assert!(validate_name("vmpod-box").is_ok());
         assert!(validate_name("").is_err());
+        assert!(validate_name(".").is_err());
+        assert!(validate_name("..").is_err());
+        assert!(validate_name("-name").is_err());
+        assert!(validate_name(".hidden").is_err());
         assert!(validate_name("name with spaces").is_err());
         assert!(validate_name("bad/slash").is_err());
         assert!(validate_name("bad:colon").is_err());
@@ -2014,6 +2080,9 @@ ID      TAG               VM_SIZE                DATE        VM_CLOCK     ICOUNT
         assert!(validate_ram("65G").is_err());
         assert!(validate_ram("128G").is_err());
         assert!(validate_ram("not_a_number").is_err());
+        assert!(validate_ram("2G\n").is_err());
+        assert!(validate_ram("2G;evil").is_err());
+        assert!(validate_ram("2G evil").is_err());
     }
 
     #[test]
@@ -2023,6 +2092,26 @@ ID      TAG               VM_SIZE                DATE        VM_CLOCK     ICOUNT
         assert!(validate_timeout(1800).is_ok());
         assert!(validate_timeout(1801).is_err());
         assert!(validate_timeout(3600).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_env_key() {
+        assert!(is_valid_env_key("FOO"));
+        assert!(is_valid_env_key("MY_VAR_1"));
+        assert!(is_valid_env_key("_SECRET"));
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("123FOO"));
+        assert!(!is_valid_env_key("FOO;evil"));
+        assert!(!is_valid_env_key("FOO=BAR"));
+        assert!(!is_valid_env_key("FOO-BAR"));
+        assert!(!is_valid_env_key("FOO BAR"));
+    }
+
+    #[test]
+    fn test_get_secure_mux_socket() {
+        let sock = get_secure_mux_socket("test-vm");
+        assert!(sock.to_string_lossy().ends_with("test-vm.sock"));
+        assert!(sock.parent().unwrap().exists());
     }
 
     #[test]

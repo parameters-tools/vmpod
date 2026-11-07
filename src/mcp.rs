@@ -5,7 +5,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::orchestrator::{
-    validate_name, validate_ram, validate_smp, validate_timeout, UpParams, VmOrchestrator,
+    validate_name, validate_ram, validate_smp, validate_snapshot_tag, validate_timeout, UpParams,
+    VmOrchestrator,
 };
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -412,6 +413,8 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing required parameter 'name'".to_string())?;
 
+            validate_name(instance_name).map_err(|e| e.to_string())?;
+
             let command = args
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -455,6 +458,8 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing required parameter 'name'".to_string())?;
 
+            validate_name(instance_name).map_err(|e| e.to_string())?;
+
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -485,6 +490,8 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing required parameter 'name'".to_string())?;
 
+            validate_name(instance_name).map_err(|e| e.to_string())?;
+
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -502,6 +509,8 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing required parameter 'name'".to_string())?;
 
+            validate_name(instance_name).map_err(|e| e.to_string())?;
+
             let action = args
                 .get("action")
                 .and_then(|v| v.as_str())
@@ -513,6 +522,8 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                         .get("tag")
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| "Missing required parameter 'tag' for snapshot create".to_string())?;
+
+                    validate_snapshot_tag(tag).map_err(|e| e.to_string())?;
 
                     let res = orchestrator
                         .snapshot_create(instance_name, tag)
@@ -535,6 +546,8 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| "Missing required parameter 'tag' for snapshot delete".to_string())?;
 
+                    validate_snapshot_tag(tag).map_err(|e| e.to_string())?;
+
                     let res = orchestrator
                         .snapshot_delete(instance_name, tag)
                         .await
@@ -555,10 +568,14 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing required parameter 'name'".to_string())?;
 
+            validate_name(instance_name).map_err(|e| e.to_string())?;
+
             let tag = args
                 .get("tag")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing required parameter 'tag'".to_string())?;
+
+            validate_snapshot_tag(tag).map_err(|e| e.to_string())?;
 
             let res = orchestrator
                 .snapshot_rollback(instance_name, tag)
@@ -573,6 +590,8 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                 .get("name")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing required parameter 'name'".to_string())?;
+
+            validate_name(instance_name).map_err(|e| e.to_string())?;
 
             let res = orchestrator
                 .status(instance_name)
@@ -596,6 +615,8 @@ async fn dispatch_tool(name: &str, args: Value, orchestrator: &VmOrchestrator) -
                 .get("name")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "Missing required parameter 'name'".to_string())?;
+
+            validate_name(instance_name).map_err(|e| e.to_string())?;
 
             let purge = args
                 .get("purge")
